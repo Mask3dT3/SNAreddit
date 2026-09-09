@@ -1,0 +1,26 @@
+name: analyze
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: analyze
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-jobs.txt
+      - run: python sna.py
+        env:
+          DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+          TARGET_SUBREDDIT: ${{ vars.TARGET_SUBREDDIT }}

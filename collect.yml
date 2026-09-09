@@ -1,0 +1,29 @@
+name: collect
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements-jobs.txt
+      - run: python collector.py poll
+        env:
+          DATABASE_URL:          ${{ secrets.DATABASE_URL }}
+          REDDIT_CLIENT_ID:      ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET:  ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT:     ${{ secrets.REDDIT_USER_AGENT }}
+          TARGET_SUBREDDIT:      ${{ vars.TARGET_SUBREDDIT }}
