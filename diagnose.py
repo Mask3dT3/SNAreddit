@@ -54,7 +54,7 @@ def reply_graph(rows, sub, cutoff):
     return G
 
 
-def coparticipation_graph(rows, max_thread=40):
+def coparticipation_graph(rows, max_thread=40, min_weight=1, report=False):
     """
     Threads gigantes viram cliques enormes e dominam tudo, entao ignoramos
     threads acima de max_thread participantes. O peso da aresta e o numero de
@@ -80,8 +80,19 @@ def coparticipation_graph(rows, max_thread=40):
         for i in range(len(m)):
             for j in range(i + 1, len(m)):
                 edges[(m[i], m[j])] += 1
+    if report:
+        h = Counter(edges.values())
+        tot = sum(h.values())
+        print("\n  distribuicao de peso das arestas de co-participacao")
+        print("  (peso = numero de threads que as duas pessoas compartilharam)")
+        for w in sorted(h)[:6]:
+            print(f"    {w} thread{'s' if w > 1 else ' '}: {h[w]:>6}  ({h[w]/tot:>5.1%})")
+        acima = sum(c for w, c in h.items() if w >= 2)
+        print(f"    >= 2 threads: {acima} arestas ({acima/tot:.1%}) — este e o sinal real")
+
     for (a, b), w in edges.items():
-        G.add_edge(a, b, weight=w)
+        if w >= min_weight:
+            G.add_edge(a, b, weight=w)
     return G
 
 
@@ -139,4 +150,6 @@ if __name__ == "__main__":
     rows, now = _rows(a.sub, a.days)
     print(f"r/{a.sub} — {a.days} dias — {len(rows)} comentarios")
     describe(reply_graph(rows, a.sub, now - a.days * 86400), "REPLY GRAPH")
-    describe(coparticipation_graph(rows), "CO-PARTICIPACAO")
+    describe(coparticipation_graph(rows, report=True), "CO-PARTICIPACAO (peso >= 1)")
+    describe(coparticipation_graph(rows, min_weight=2), "CO-PARTICIPACAO (peso >= 2)")
+    describe(coparticipation_graph(rows, min_weight=3), "CO-PARTICIPACAO (peso >= 3)")
