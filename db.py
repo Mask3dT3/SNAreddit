@@ -1,10 +1,9 @@
 """
 Camada de dados sobre Postgres (Supabase).
 
-A string de conexao vem de DATABASE_URL. Pegue no botao "Connect" no topo da
-pagina do projeto no Supabase, aba "Session pooler" (porta 5432). Nao use a
-"Direct connection": ela so responde por IPv6, e os runners do GitHub Actions
-nao tem IPv6.
+A string de conexao vem de DATABASE_URL. Use a connection string do modo
+"Session pooler" do Supabase (porta 6543) — o cron abre e fecha conexao a cada
+execucao, e o pooler existe exatamente para isso.
 """
 import os
 import time
@@ -76,25 +75,28 @@ def upsert_submissions(rows):
 def save_graph_snapshot(row):
     _bulk(
         """insert into graph_snapshots
-             (ts, window_hours, subreddit, n_nodes, n_edges, density, reciprocity,
-              assortativity, max_core, n_communities, modularity, gini_activity,
-              new_authors)
-           values (%(ts)s, %(window_hours)s, %(subreddit)s, %(n_nodes)s, %(n_edges)s,
-                   %(density)s, %(reciprocity)s, %(assortativity)s, %(max_core)s,
-                   %(n_communities)s, %(modularity)s, %(gini_activity)s, %(new_authors)s)
-           on conflict (ts, window_hours, subreddit) do nothing""",
+             (ts, projection, window_hours, subreddit, n_nodes, n_edges, density,
+              reciprocity, assortativity, max_core, n_communities, modularity,
+              gini_activity, new_authors, n_components, giant_frac, clustering,
+              leaf_frac)
+           values (%(ts)s, %(projection)s, %(window_hours)s, %(subreddit)s,
+                   %(n_nodes)s, %(n_edges)s, %(density)s, %(reciprocity)s,
+                   %(assortativity)s, %(max_core)s, %(n_communities)s,
+                   %(modularity)s, %(gini_activity)s, %(new_authors)s,
+                   %(n_components)s, %(giant_frac)s, %(clustering)s, %(leaf_frac)s)
+           on conflict (ts, projection, window_hours, subreddit) do nothing""",
         [row])
 
 
 def save_actor_snapshots(rows):
     return _bulk(
         """insert into actor_snapshots
-             (ts, window_hours, subreddit, author, in_degree, out_degree,
-              w_in_degree, pagerank, betweenness, coreness, community)
-           values (%(ts)s, %(window_hours)s, %(subreddit)s, %(author)s, %(in_degree)s,
-                   %(out_degree)s, %(w_in_degree)s, %(pagerank)s, %(betweenness)s,
-                   %(coreness)s, %(community)s)
-           on conflict (ts, window_hours, subreddit, author) do nothing""",
+             (ts, projection, window_hours, subreddit, author, in_degree,
+              out_degree, w_in_degree, pagerank, betweenness, coreness, community)
+           values (%(ts)s, %(projection)s, %(window_hours)s, %(subreddit)s,
+                   %(author)s, %(in_degree)s, %(out_degree)s, %(w_in_degree)s,
+                   %(pagerank)s, %(betweenness)s, %(coreness)s, %(community)s)
+           on conflict (ts, projection, window_hours, subreddit, author) do nothing""",
         rows)
 
 
