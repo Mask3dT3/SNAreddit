@@ -1,43 +1,60 @@
 """
 Motor de SNA. Roda sob cron, grava snapshots, sai.
 
-  python sna.py --sub brasil
+  python sna.py --sub idiomas
 
-Mesma logica da versao local; muda so a camada de dados (Postgres) e o fato de
-que ele aplica a retencao no fim de cada execucao.
+Calcula DUAS projecoes do mesmo dado, lado a lado:
+
+  reply   — A respondeu B. Interacao real, mas em subs de servico produz
+            arvores: sem triangulos, sem faccoes.
+  copart  — A e B comentaram no mesmo post. Captura frequentacao comum mesmo
+            sem interacao direta. Mais densa, porem cada thread vira um clique,
+            entao clusterizacao e k-core sao parcialmente artefato.
+
+Nenhuma das duas e "a certa" a priori. Por isso cada snapshot grava tambem os
+diagnosticos estruturais (componentes, componente gigante, clusterizacao,
+fracao de folhas): sao eles que dizem se as metricas daquela projecao
+significam algo naquele sub, naquela janela.
 """
 import os
 import sys
 import time
 import math
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 
 import networkx as nx
 
 import db
 
 BOTS = {"AutoModerator", "[deleted]", "None", None, ""}
-WINDOWS = (24, 168, 720)
+WINDOWS = (168, 720, 2160)          # 7d, 30d, 90d
+PROJECTIONS = ("reply", "copart")
+MAX_THREAD = 40                      # threads maiores viram cliques que dominam tudo
 
 
-def build_reply_graph(subreddit, window_hours, now=None):
+# ------------------------------------------------------------- construcao
+
+def _comments(sub, cutoff, now):
+    return db.query(
+        """select id, parent_id, author, submission_id, created_utc
+           from comments where subreddit=%s and created_utc>=%s and created_utc<=%s""",
+        (sub.lower(), cutoff, now))
+
+
+def build_reply_graph(sub, window_hours, now=None):
+    """Dirigido e ponderado: A -> B com peso = numero de respostas."""
     now = now or time.time()
     cutoff = now - window_hours * 3600
-    sub = subreddit.lower()
+    rows = _comments(sub, cutoff, now)
 
-    rows = db.query(
-        """select id, parent_id, author, created_utc from comments
-           where subreddit=%s and created_utc>=%s and created_utc<=%s""",
-        (sub, cutoff, now))
     posts = {r["id"]: r["author"] for r in db.query(
         "select id, author from submissions where subreddit=%s and created_utc>=%s",
-        (sub, cutoff - 30 * 86400))}
-    # Resolucao de pai inclui comentarios fora da janela: uma resposta na janela
-    # a um comentario antigo continua sendo uma aresta valida.
+        (sub.lower(), cutoff - 30 * 86400))}
+    # Pais fora da janela ainda valem: responder hoje um comentario antigo e aresta.
     author_of = {r["id"]: r["author"] for r in db.query(
         "select id, author from comments where subreddit=%s and created_utc>=%s",
-        (sub, cutoff - 14 * 86400))}
+        (sub.lower(), cutoff - 14 * 86400))}
 
     edges, activity = Counter(), Counter()
     for r in rows:
@@ -46,19 +63,60 @@ def build_reply_graph(subreddit, window_hours, now=None):
             continue
         activity[src] += 1
         pid = r["parent_id"] or ""
-        dst = author_of.get(pid[3:]) if pid.startswith("t1_") else (
-            posts.get(pid[3:]) if pid.startswith("t3_") else None)
-        if not dst or dst in BOTS or dst == src:
-            continue
-        edges[(src, dst)] += 1
+        dst = (author_of.get(pid[3:]) if pid.startswith("t1_")
+               else posts.get(pid[3:]) if pid.startswith("t3_") else None)
+        if dst and dst not in BOTS and dst != src:
+            edges[(src, dst)] += 1
 
     G = nx.DiGraph()
-    G.add_nodes_from(activity.keys())
+    G.add_nodes_from(activity)
     for (s, d), w in edges.items():
         G.add_edge(s, d, weight=w)
     nx.set_node_attributes(G, dict(activity), "activity")
     return G
 
+
+def build_copart_graph(sub, window_hours, now=None, min_weight=1):
+    """
+    Nao-dirigido: A -- B se comentaram no mesmo post. Peso = threads em comum.
+    min_weight=2 filtra o encontro casual e deixa so a frequentacao recorrente
+    — mas em subs de baixa recorrencia isso costuma desintegrar o grafo.
+    """
+    now = now or time.time()
+    cutoff = now - window_hours * 3600
+    rows = _comments(sub, cutoff, now)
+
+    by_post, activity = defaultdict(set), Counter()
+    for r in rows:
+        a = r["author"]
+        if not a or a in BOTS:
+            continue
+        activity[a] += 1
+        if r["submission_id"]:
+            by_post[r["submission_id"]].add(a)
+
+    edges = Counter()
+    for members in by_post.values():
+        m = sorted(members)
+        if len(m) < 2 or len(m) > MAX_THREAD:
+            continue
+        for i in range(len(m)):
+            for j in range(i + 1, len(m)):
+                edges[(m[i], m[j])] += 1
+
+    G = nx.Graph()
+    G.add_nodes_from(activity)
+    for (a, b), w in edges.items():
+        if w >= min_weight:
+            G.add_edge(a, b, weight=w)
+    nx.set_node_attributes(G, dict(activity), "activity")
+    return G
+
+
+BUILDERS = {"reply": build_reply_graph, "copart": build_copart_graph}
+
+
+# --------------------------------------------------------------- metricas
 
 def _gini(values):
     v = sorted(values)
@@ -73,97 +131,136 @@ def compute_metrics(G, betweenness_sample=400):
     if n < 3:
         return {}, {}
 
-    Us = nx.Graph(G.to_undirected())
-    Us.remove_edges_from(nx.selfloop_edges(Us))
+    directed = G.is_directed()
+    U = nx.Graph(G.to_undirected() if directed else G)
+    U.remove_edges_from(nx.selfloop_edges(U))
+
+    # --- diagnosticos estruturais: dizem se o resto significa algo
+    comps = sorted(nx.connected_components(U), key=len, reverse=True)
+    giant = U.subgraph(comps[0]).copy() if comps else U
+    degs = dict(U.degree())
+    leaf_frac = sum(1 for d in degs.values() if d <= 1) / n
 
     try:
         pr = nx.pagerank(G, weight="weight", max_iter=200)
     except nx.PowerIterationFailedConvergence:
         pr = {v: 1 / n for v in G}
 
-    # Betweenness no grafo NAO-DIRIGIDO, de proposito: um broker que so responde
-    # tem in_degree zero e betweenness dirigido zero, mas e exatamente a conta
-    # que liga as faccoes. Corretagem e uma pergunta nao-dirigida.
-    bt = nx.betweenness_centrality(Us, k=min(betweenness_sample, n),
+    # Betweenness no nao-dirigido de proposito: um broker que so responde tem
+    # grau de entrada zero e betweenness dirigido zero, mesmo sendo justamente
+    # quem liga os grupos. Corretagem e pergunta nao-dirigida.
+    bt = nx.betweenness_centrality(U, k=min(betweenness_sample, n),
                                    normalized=True, seed=42)
-    core = nx.core_number(Us)
+    core = nx.core_number(U)
 
+    # Comunidades so no componente gigante — rodar no grafo inteiro conta cada
+    # pedaco solto como uma "comunidade" e infla a modularidade.
     try:
-        parts = nx.community.louvain_communities(Us, weight="weight", seed=42)
-        modularity = nx.community.modularity(Us, parts, weight="weight")
+        parts = nx.community.louvain_communities(giant, weight="weight", seed=42)
+        modularity = nx.community.modularity(giant, parts, weight="weight")
     except Exception:
-        parts, modularity = [set(Us.nodes())], 0.0
+        parts, modularity = [set(giant)], 0.0
     comm_of = {v: i for i, p in enumerate(parts) for v in p}
 
-    try:
-        assort = nx.degree_assortativity_coefficient(G)
-        assort = 0.0 if math.isnan(assort) else assort
-    except Exception:
-        assort = 0.0
+    if directed:
+        recip = nx.reciprocity(G) or 0.0
+        try:
+            assort = nx.degree_assortativity_coefficient(G)
+            assort = 0.0 if math.isnan(assort) else assort
+        except Exception:
+            assort = 0.0
+    else:
+        recip = None          # 1.0 por construcao: nao informa nada
+        try:
+            assort = nx.degree_assortativity_coefficient(U)
+            assort = 0.0 if math.isnan(assort) else assort
+        except Exception:
+            assort = 0.0
 
     graph_m = {
         "n_nodes": n, "n_edges": G.number_of_edges(),
-        "density": nx.density(G), "reciprocity": nx.reciprocity(G) or 0.0,
-        "assortativity": assort, "max_core": max(core.values()) if core else 0,
+        "density": nx.density(G), "reciprocity": recip, "assortativity": assort,
+        "max_core": max(core.values()) if core else 0,
         "n_communities": len(parts), "modularity": modularity,
         "gini_activity": _gini([d.get("activity", 0) for _, d in G.nodes(data=True)]),
+        "n_components": len(comps),
+        "giant_frac": len(comps[0]) / n if comps else 0.0,
+        "clustering": nx.average_clustering(giant) if giant.number_of_nodes() > 2 else 0.0,
+        "leaf_frac": leaf_frac,
     }
     actors = {v: {
-        "in_degree": G.in_degree(v), "out_degree": G.out_degree(v),
-        "w_in_degree": G.in_degree(v, weight="weight"),
+        "in_degree": G.in_degree(v) if directed else degs.get(v, 0),
+        "out_degree": G.out_degree(v) if directed else degs.get(v, 0),
+        "w_in_degree": (G.in_degree(v, weight="weight") if directed
+                        else U.degree(v, weight="weight")),
         "pagerank": pr.get(v, 0.0), "betweenness": bt.get(v, 0.0),
         "coreness": core.get(v, 0), "community": comm_of.get(v, -1),
     } for v in G.nodes()}
     return graph_m, actors
 
 
-def count_new_authors(subreddit, window_hours, now=None):
+def count_new_authors(sub, window_hours, now=None):
     now = now or time.time()
     r = db.query(
         """select count(*) as n from (
              select author, min(created_utc) as first_seen from comments
              where subreddit=%s and author is not null group by author
            ) t where first_seen >= %s""",
-        (subreddit.lower(), now - window_hours * 3600))
+        (sub.lower(), now - window_hours * 3600))
     return r[0]["n"] if r else 0
 
 
-def snapshot(subreddit, window_hours, now=None):
+# ------------------------------------------------------------------ runner
+
+def snapshot(sub, projection, window_hours, now=None):
     now = now or time.time()
-    G = build_reply_graph(subreddit, window_hours, now)
+    G = BUILDERS[projection](sub, window_hours, now)
     gm, actors = compute_metrics(G)
     if not gm:
-        print(f"  {window_hours}h: dados insuficientes")
+        print(f"  {projection:>6} {window_hours:>4}h: dados insuficientes")
         return
 
     db.save_graph_snapshot({
-        "ts": now, "window_hours": window_hours, "subreddit": subreddit.lower(),
-        "new_authors": count_new_authors(subreddit, window_hours, now), **gm})
+        "ts": now, "projection": projection, "window_hours": window_hours,
+        "subreddit": sub.lower(),
+        "new_authors": count_new_authors(sub, window_hours, now), **gm})
     db.save_actor_snapshots([
-        {"ts": now, "window_hours": window_hours, "subreddit": subreddit.lower(),
-         "author": a, **m} for a, m in actors.items()])
-    print(f"  {window_hours:>3}h: {gm['n_nodes']} nos, {gm['n_edges']} arestas, "
-          f"k-core {gm['max_core']}, {gm['n_communities']} comunidades, "
-          f"recip {gm['reciprocity']:.3f}")
+        {"ts": now, "projection": projection, "window_hours": window_hours,
+         "subreddit": sub.lower(), "author": a, **m} for a, m in actors.items()])
+
+    aviso = ""
+    if gm["clustering"] < 0.10:
+        aviso = "  << sem triangulos: comunidades pouco confiaveis"
+    elif gm["giant_frac"] < 0.40:
+        aviso = "  << fragmentado: metricas globais pouco confiaveis"
+    print(f"  {projection:>6} {window_hours:>4}h: {gm['n_nodes']:>4} nos, "
+          f"{gm['n_edges']:>5} arestas, gigante {gm['giant_frac']:.0%}, "
+          f"clust {gm['clustering']:.3f}, mod {gm['modularity']:.3f}{aviso}")
 
 
-def risers(subreddit, window_hours, metric="betweenness", lookback_hours=6, top=15):
-    """Quem SUBIU, nao quem esta no topo. E aqui que brigada e astroturfing aparecem."""
+def risers(sub, window_hours, projection="reply", metric="betweenness",
+           lookback_hours=48, top=15):
+    """
+    Quem SUBIU, nao quem esta no topo. Rankings de rede sao estaveis e chatos;
+    a derivada e onde aparece brigada, astroturfing e conta nova ganhando tracao.
+    """
     if metric not in {"betweenness", "pagerank", "w_in_degree", "coreness"}:
         raise ValueError("metrica invalida")
-    sub, now = subreddit.lower(), time.time()
+    sub, now = sub.lower(), time.time()
+    args = (sub, window_hours, projection)
     cur = db.query(
         f"""select author, {metric} as v from actor_snapshots
-            where subreddit=%s and window_hours=%s and ts=(
+            where subreddit=%s and window_hours=%s and projection=%s and ts=(
               select max(ts) from actor_snapshots
-              where subreddit=%s and window_hours=%s)""",
-        (sub, window_hours, sub, window_hours))
+              where subreddit=%s and window_hours=%s and projection=%s)""",
+        args * 2)
     old = db.query(
         f"""select author, {metric} as v from actor_snapshots
-            where subreddit=%s and window_hours=%s and ts=(
+            where subreddit=%s and window_hours=%s and projection=%s and ts=(
               select max(ts) from actor_snapshots
-              where subreddit=%s and window_hours=%s and ts<=%s)""",
-        (sub, window_hours, sub, window_hours, now - lookback_hours * 3600))
+              where subreddit=%s and window_hours=%s and projection=%s
+                and ts<=%s)""",
+        args * 2 + (now - lookback_hours * 3600,))
     prev = {r["author"]: (r["v"] or 0) for r in old}
     out = [{"author": r["author"], "antes": prev.get(r["author"], 0),
             "agora": r["v"] or 0, "delta": (r["v"] or 0) - prev.get(r["author"], 0)}
@@ -174,15 +271,18 @@ def risers(subreddit, window_hours, metric="betweenness", lookback_hours=6, top=
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--sub", default=os.environ.get("TARGET_SUBREDDIT"))
+    ap.add_argument("--projection", choices=list(PROJECTIONS) + ["all"], default="all")
     ap.add_argument("--no-prune", action="store_true")
     a = ap.parse_args()
     if not a.sub:
         sys.exit("informe --sub ou defina TARGET_SUBREDDIT")
 
-    print(f"snapshot r/{a.sub}")
+    projs = PROJECTIONS if a.projection == "all" else (a.projection,)
     t = time.time()
-    for w in WINDOWS:
-        snapshot(a.sub, w, now=t)
+    print(f"snapshot r/{a.sub}")
+    for proj in projs:
+        for w in WINDOWS:
+            snapshot(a.sub, proj, w, now=t)
     if not a.no_prune:
         db.prune()
     print(f"banco: {db.db_size_mb()} MB / 500 MB")
