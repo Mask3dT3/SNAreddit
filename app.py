@@ -43,21 +43,23 @@ def hot_data(sub):
 
 
 @st.cache_data(ttl=300)
-def cold_data(sub, win):
+def cold_data(sub, win, proj):
     gs = pd.DataFrame(db.query(
-        """select * from graph_snapshots where subreddit=%s and window_hours=%s
-           order by ts""", (sub, win)))
+        """select * from graph_snapshots
+           where subreddit=%s and window_hours=%s and projection=%s
+           order by ts""", (sub, win, proj)))
     actors = pd.DataFrame(db.query(
-        """select * from actor_snapshots where subreddit=%s and window_hours=%s
+        """select * from actor_snapshots
+           where subreddit=%s and window_hours=%s and projection=%s
            and ts=(select max(ts) from actor_snapshots
-                   where subreddit=%s and window_hours=%s)""",
-        (sub, win, sub, win)))
+                   where subreddit=%s and window_hours=%s and projection=%s)""",
+        (sub, win, proj, sub, win, proj)))
     return gs, actors
 
 
 @st.cache_data(ttl=300, show_spinner="Montando o grafo...")
-def graph_layout(sub, win, top_n=120):
-    G = sna.build_reply_graph(sub, win)
+def graph_layout(sub, win, proj, top_n=120):
+    G = sna.BUILDERS[proj](sub, win)
     if G.number_of_nodes() < 3:
         return None
     keep = sorted(G.nodes(), key=lambda v: -G.degree(v, weight="weight"))[:top_n]
@@ -74,8 +76,14 @@ if not subs:
 
 SUB = st.sidebar.selectbox("Subreddit", subs)
 WIN = st.sidebar.select_slider(
-    "Janela", options=[24, 168, 720], value=24,
-    format_func=lambda h: {24: "24 horas", 168: "7 dias", 720: "30 dias"}[h])
+    "Janela", options=[168, 720, 2160], value=720,
+    format_func=lambda h: {168: "7 dias", 720: "30 dias", 2160: "90 dias"}[h])
+PROJ = st.sidebar.radio(
+    "Projeção do grafo", ["reply", "copart"],
+    format_func=lambda p: {"reply": "Reply graph (quem responde quem)",
+                           "copart": "Co-participação (mesma thread)"}[p],
+    help="Reply graph mede interação direta. Co-participação mede frequentação "
+         "comum e é mais densa, mas cada thread vira um clique.")
 if st.sidebar.button("Recarregar agora"):
     st.cache_data.clear()
     st.rerun()
@@ -96,7 +104,9 @@ if not vol.empty:
     c[2].metric("Autores únicos", int(uniq))
     c[3].metric("Autores novos", int(novos))
 
-    if ratio > 2.5:
+    # Sub de baixo volume: exigir massa absoluta antes de gritar burst, senao
+    # 3 comentarios viram "300% acima do baseline" todo santo dia.
+    if ratio > 2.5 and last_h >= 15:
         st.error(f"Burst: volume {ratio:.1f}x acima do baseline.")
 
     f = go.Figure()
@@ -117,7 +127,7 @@ if not vol.empty:
                             f"score {r['score']}  \n{str(r['body'])[:280]}")
 
 st.divider()
-gs, actors = cold_data(SUB, WIN)
+gs, actors = cold_data(SUB, WIN, PROJ)
 
 if gs.empty:
     st.info("Nenhum snapshot ainda — o job de análise ainda não rodou.")
@@ -126,14 +136,39 @@ if gs.empty:
 cur = gs.iloc[-1]
 prev = gs.iloc[-2] if len(gs) > 1 else cur
 
+st.subheader("Confiabilidade estrutural")
+st.caption("Estes quatro números dizem se as métricas abaixo significam algo "
+           "nesta projeção. Ignore-os e você vai interpretar fragmentação como facção.")
+d = st.columns(4)
+d[0].metric("Componente gigante", f"{cur['giant_frac']:.0%}",
+            help="Abaixo de 40%, o grafo é poeira e métricas globais não valem.")
+d[1].metric("Clusterização", f"{cur['clustering']:.3f}",
+            help="Perto de zero = sem triângulos = topologia de árvore. "
+                 "Detecção de comunidade fica não confiável.")
+d[2].metric("Fração de folhas", f"{cur['leaf_frac']:.0%}",
+            help="Participantes que aparecem uma vez e somem.")
+d[3].metric("Componentes", int(cur["n_components"]))
+
+if cur["clustering"] < 0.10:
+    st.warning("Clusterização abaixo de 0,10: o grafo não tem triângulos. "
+               "As comunidades detectadas provavelmente são artefato do Louvain "
+               "particionando uma árvore, não facções reais.")
+elif cur["giant_frac"] < 0.40:
+    st.warning("Componente gigante abaixo de 40%: o grafo está fragmentado e as "
+               "métricas globais descrevem pedaços soltos.")
+
 st.subheader("Estrutura da comunidade")
 m = st.columns(5)
 m[0].metric("Participantes", int(cur["n_nodes"]), delta=int(cur["n_nodes"] - prev["n_nodes"]))
 m[1].metric("k-core máximo", int(cur["max_core"]), delta=int(cur["max_core"] - prev["max_core"]),
             help="Núcleo duro. Queda sustentada = sub esvaziando.")
-m[2].metric("Reciprocidade", f"{cur['reciprocity']:.3f}",
-            delta=f"{cur['reciprocity'] - prev['reciprocity']:+.3f}",
-            help="Baixa = broadcast, não conversa.")
+if cur["reciprocity"] is None:
+    m[2].metric("Reciprocidade", "n/a",
+                help="Não se aplica: co-participação é não-dirigida por construção.")
+else:
+    m[2].metric("Reciprocidade", f"{cur['reciprocity']:.3f}",
+                delta=f"{cur['reciprocity'] - (prev['reciprocity'] or 0):+.3f}",
+                help="Baixa = broadcast, não conversa.")
 m[3].metric("Assortatividade", f"{cur['assortativity']:.3f}",
             help="Positiva = heavy users só falam entre si.")
 m[4].metric("Gini de atividade", f"{cur['gini_activity']:.3f}",
@@ -142,8 +177,8 @@ m[4].metric("Gini de atividade", f"{cur['gini_activity']:.3f}",
 if len(gs) > 3:
     gs["ts_dt"] = pd.to_datetime(gs["ts"], unit="s")
     met = st.selectbox("Série histórica",
-                       ["max_core", "n_nodes", "reciprocity", "gini_activity",
-                        "modularity", "n_communities", "new_authors"])
+                       ["max_core", "n_nodes", "clustering", "giant_frac", "modularity",
+                        "n_communities", "leaf_frac", "gini_activity", "new_authors"])
     st.plotly_chart(
         go.Figure(go.Scatter(x=gs["ts_dt"], y=gs[met], mode="lines+markers"))
           .update_layout(height=220, margin=dict(t=10, b=10, l=0, r=0)),
@@ -161,12 +196,12 @@ with tb:
         ["author", "betweenness", "community", "in_degree", "out_degree"]],
         use_container_width=True, hide_index=True)
 with tc:
-    st.caption("Maior variação de betweenness em 6h — onde brigada e astroturfing aparecem.")
-    st.dataframe(pd.DataFrame(sna.risers(SUB, WIN, "betweenness", 6)),
+    st.caption("Maior variação de betweenness em 48h — onde brigada e astroturfing aparecem.")
+    st.dataframe(pd.DataFrame(sna.risers(SUB, WIN, PROJ, "betweenness", 48)),
                  use_container_width=True, hide_index=True)
 
 st.subheader("Reply graph")
-res = graph_layout(SUB, WIN)
+res = graph_layout(SUB, WIN, PROJ)
 if res:
     edges, pos = res
     comm = dict(zip(actors["author"], actors["community"]))
