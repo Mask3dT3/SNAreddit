@@ -100,10 +100,16 @@ if not vol.empty:
     # ingestao — compara-la com o baseline produz "-100%" todo dia. Recortamos
     # a zona de atraso e usamos 6h, que num sub de ~3 comentarios/hora e a menor
     # janela com massa suficiente para significar algo.
-    fresh = vol[vol["bucket"] < now - LAG]
-    recente = int(fresh[fresh["bucket"] >= now - LAG - 6 * 3600]["n"].sum())
-    hist = fresh[fresh["bucket"] < now - LAG - 6 * 3600]["n"]
-    base = hist.mean() * 72 if len(hist) else 0     # 72 buckets de 5 min = 6h
+    # Intervalos SEM comentario nao viram linha no group by, entao media por
+    # intervalo conta so os ativos e infla o baseline. Num sub de 3 comentarios
+    # por hora, a maioria dos intervalos esta vazia. Usamos total / tempo
+    # decorrido, que independe de quantos intervalos existem.
+    fim = now - LAG
+    ini = fim - 6 * 3600
+    recente = int(vol[(vol["bucket"] >= ini) & (vol["bucket"] < fim)]["n"].sum())
+    hist = vol[vol["bucket"] < ini]["n"].sum()
+    horas_hist = (ini - (now - 86400)) / 3600
+    base = (hist / horas_hist * 6) if horas_hist > 0 else 0
     ratio = recente / base if base else 1
     renov = novos / uniq if uniq else 0
 
@@ -272,6 +278,6 @@ if res:
         marker=dict(size=[8 + 40 * prk.get(v, 0) / smax for v in ns],
                     color=[comm.get(v, -1) for v in ns], colorscale="Turbo",
                     line=dict(width=0.5, color="white"))))
-    fig.update_layout(height=560, showlegend=False, margin=dict(t=10, b=10, l=0, r=0),
+    fig.update_layout(height=430, showlegend=False, margin=dict(t=5, b=5, l=0, r=0),
                       xaxis=dict(visible=False), yaxis=dict(visible=False))
     st.plotly_chart(fig, use_container_width=True)
