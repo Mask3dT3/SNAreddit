@@ -92,31 +92,40 @@ st.sidebar.caption(f"Banco: {db.db_size_mb()} MB / 500 MB")
 st.title(f"r/{SUB}")
 
 vol, head, uniq, novos, now = hot_data(SUB)
+LAG = 1800   # o Arctic Shift ingere com ~10-15 min de atraso; damos 30 de folga
 if not vol.empty:
     vol["ts"] = pd.to_datetime(vol["bucket"], unit="s")
-    last_h = int(vol[vol["bucket"] >= now - 3600]["n"].sum())
-    base = vol[vol["bucket"] < now - 3600]["n"].mean() * 12
-    ratio = last_h / base if base else 1
+
+    # A hora corrente esta SEMPRE parcialmente vazia por causa do atraso de
+    # ingestao — compara-la com o baseline produz "-100%" todo dia. Recortamos
+    # a zona de atraso e usamos 6h, que num sub de ~3 comentarios/hora e a menor
+    # janela com massa suficiente para significar algo.
+    fresh = vol[vol["bucket"] < now - LAG]
+    recente = int(fresh[fresh["bucket"] >= now - LAG - 6 * 3600]["n"].sum())
+    hist = fresh[fresh["bucket"] < now - LAG - 6 * 3600]["n"]
+    base = hist.mean() * 72 if len(hist) else 0     # 72 buckets de 5 min = 6h
+    ratio = recente / base if base else 1
+    renov = novos / uniq if uniq else 0
 
     c = st.columns(4)
     c[0].metric("Comentários / 24h", int(vol["n"].sum()))
-    c[1].metric("Última hora", last_h, delta=f"{(ratio - 1) * 100:+.0f}% vs baseline")
-    c[2].metric("Autores únicos", int(uniq))
-    c[3].metric("Autores novos", int(novos))
+    c[1].metric("Últimas 6h", recente,
+                delta=f"{(ratio - 1) * 100:+.0f}% vs média",
+                help="Exclui os últimos 30 min: o arquivo tem atraso de ingestão "
+                     "e a hora corrente está sempre incompleta.")
+    c[2].metric("Autores únicos / 24h", int(uniq))
+    c[3].metric("Renovação", f"{renov:.0%}",
+                help="Fração dos autores de hoje que nunca apareceram antes. "
+                     "Alta e sustentada = fluxo de estranhos, não comunidade.")
 
-    # Sub de baixo volume: exigir massa absoluta antes de gritar burst, senao
-    # 3 comentarios viram "300% acima do baseline" todo santo dia.
-    if ratio > 2.5 and last_h >= 15:
-        st.error(f"Burst: volume {ratio:.1f}x acima do baseline.")
+    if ratio > 2.5 and recente >= 40:
+        st.error(f"Burst: volume {ratio:.1f}x acima da média das últimas 24h.")
 
     f = go.Figure()
-    f.add_trace(go.Scatter(x=vol["ts"], y=vol["n"], name="comentários",
-                           mode="lines", fill="tozeroy"))
-    f.add_trace(go.Scatter(x=vol["ts"], y=vol["autores"], name="autores únicos",
-                           mode="lines", yaxis="y2"))
-    f.update_layout(height=240, margin=dict(t=20, b=20, l=0, r=0),
-                    yaxis2=dict(overlaying="y", side="right"),
-                    legend=dict(orientation="h", y=1.18))
+    f.add_trace(go.Scatter(x=vol["ts"], y=vol["n"], mode="lines", fill="tozeroy",
+                           name="comentários", line=dict(width=1.5)))
+    f.update_layout(height=220, margin=dict(t=20, b=20, l=0, r=0), showlegend=False,
+                    yaxis=dict(title="comentários / 5 min", rangemode="tozero"))
     st.plotly_chart(f, use_container_width=True)
 
     if not head.empty:
@@ -185,22 +194,62 @@ if len(gs) > 3:
         use_container_width=True)
 
 st.subheader("Atores")
-ta, tb, tc = st.tabs(["Influência", "Brokers", "Em ascensão"])
-with ta:
-    st.dataframe(actors.nlargest(20, "pagerank")[
-        ["author", "pagerank", "w_in_degree", "out_degree", "coreness", "community"]],
-        use_container_width=True, hide_index=True)
-with tb:
-    st.caption("Betweenness alto liga clusters que não se falam.")
-    st.dataframe(actors.nlargest(20, "betweenness")[
-        ["author", "betweenness", "community", "in_degree", "out_degree"]],
-        use_container_width=True, hide_index=True)
-with tc:
-    st.caption("Maior variação de betweenness em 48h — onde brigada e astroturfing aparecem.")
-    st.dataframe(pd.DataFrame(sna.risers(SUB, WIN, PROJ, "betweenness", 48)),
-                 use_container_width=True, hide_index=True)
+frouxo = cur["clustering"] < 0.10
 
-st.subheader("Reply graph")
+ta, tb, tc, td = st.tabs(["Procurados", "Quem atende", "Brokers", "Em ascensão"])
+
+with ta:
+    st.caption("Ordenado por respostas recebidas — quem a comunidade procura. "
+               "O PageRank fica na tabela para comparação, mas veja o aviso.")
+    if frouxo:
+        st.info("Sem triângulos no grafo, o PageRank fica instável: uma única "
+                "resposta vinda de alguém central transfere peso demais, e nada "
+                "amortece. Repare nas linhas com grau de entrada 1 e PageRank "
+                "alto. Nesta projeção, grau ponderado é a leitura honesta.")
+    st.dataframe(
+        actors.nlargest(20, "w_in_degree")[
+            ["author", "w_in_degree", "in_degree", "out_degree", "pagerank",
+             "coreness", "community"]],
+        use_container_width=True, hide_index=True,
+        column_config={"w_in_degree": "respostas recebidas",
+                       "in_degree": "pessoas distintas",
+                       "out_degree": "respostas dadas"})
+
+with tb:
+    st.caption("Ordenado por respostas dadas — quem sustenta o atendimento. "
+               "Num sub de serviço, é este o papel que carrega o lugar.")
+    if "out_degree" in actors:
+        d = actors.nlargest(20, "out_degree")[
+            ["author", "out_degree", "w_in_degree", "coreness", "community"]].copy()
+        d["saldo"] = d["out_degree"] - d["w_in_degree"]
+        st.dataframe(d, use_container_width=True, hide_index=True,
+                     column_config={"out_degree": "respostas dadas",
+                                    "w_in_degree": "recebidas",
+                                    "saldo": "saldo (dá − recebe)"})
+
+with tc:
+    st.caption("Betweenness alto liga partes do grafo que não se tocam.")
+    if frouxo:
+        st.info("Num grafo sem triângulos, betweenness mede posição numa árvore, "
+                "não corretagem entre grupos. Continua sendo um sinal de quem "
+                "está no caminho da informação, mas não leia como 'ponte entre "
+                "facções'.")
+    st.dataframe(
+        actors.nlargest(20, "betweenness")[
+            ["author", "betweenness", "community", "in_degree", "out_degree"]],
+        use_container_width=True, hide_index=True)
+
+with td:
+    st.caption("Maior variação de betweenness em 48h. Precisa de pelo menos dois "
+               "dias de snapshots acumulados para dizer algo.")
+    r = pd.DataFrame(sna.risers(SUB, WIN, PROJ, "betweenness", 48))
+    if r.empty or (r["delta"].abs().max() or 0) == 0:
+        st.info("Ainda sem histórico suficiente. Vai popular sozinho conforme o "
+                "workflow de análise acumula execuções.")
+    else:
+        st.dataframe(r, use_container_width=True, hide_index=True)
+
+st.subheader("Reply graph" if PROJ == "reply" else "Grafo de co-participação")
 res = graph_layout(SUB, WIN, PROJ)
 if res:
     edges, pos = res
