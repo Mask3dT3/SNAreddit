@@ -71,6 +71,27 @@ create table if not exists mentions (
     primary key (comment_id, target_author)
 );
 
+-- Frequencia de termo por dia, extraida do body assim que o comentario
+-- chega (mesmo job das mencoes). Agregado por DIA, nao por comentario —
+-- por isso pesa uma fracao do texto bruto mesmo cobrindo 90 dias. A nuvem
+-- de palavras soma os dias dentro da janela escolhida, igual as demais
+-- metricas. terms_seen evita contar o mesmo comentario 2x entre execucoes
+-- do cron que se sobrepoem.
+create table if not exists daily_terms (
+    day        double precision not null,
+    subreddit  text not null,
+    term       text not null,
+    n          integer not null default 0,
+    primary key (day, subreddit, term)
+);
+
+create table if not exists terms_seen (
+    comment_id  text primary key,
+    seen_utc    double precision not null
+);
+
+create index if not exists idx_daily_terms_sub_day on daily_terms(subreddit, day);
+
 create index if not exists idx_comments_created on comments(subreddit, created_utc);
 create index if not exists idx_comments_author  on comments(subreddit, author);
 create index if not exists idx_comments_parent  on comments(parent_id);
@@ -99,5 +120,11 @@ begin
 
     delete from mentions
      where created_utc < extract(epoch from now()) - 120*86400;
+
+    delete from daily_terms
+     where day < extract(epoch from now()) - 120*86400;
+
+    delete from terms_seen
+     where seen_utc < extract(epoch from now()) - 120*86400;
 end;
 $$ language plpgsql;

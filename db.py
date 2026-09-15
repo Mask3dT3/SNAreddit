@@ -137,6 +137,46 @@ def mentions_received(sub, window_hours, now=None):
         (sub.lower(), now - window_hours * 3600, _BOTS_LOWER))
 
 
+def unseen_comment_ids(ids):
+    """ids ja contados em daily_terms (terms_seen) saem da lista — evita
+    contar o mesmo comentario de novo entre execucoes do cron que se
+    sobrepoem (lookback_hours > intervalo do cron, de proposito)."""
+    ids = list(ids)
+    if not ids:
+        return set()
+    rows = query("select comment_id from terms_seen where comment_id = any(%s)", (ids,))
+    return set(ids) - {r["comment_id"] for r in rows}
+
+
+def mark_terms_seen(ids, now):
+    return _bulk(
+        "insert into terms_seen (comment_id, seen_utc) values (%(comment_id)s, %(seen_utc)s) "
+        "on conflict (comment_id) do nothing",
+        [{"comment_id": i, "seen_utc": now} for i in ids])
+
+
+def upsert_daily_terms(rows):
+    """Soma no que ja existe (nao substitui) — cada linha e um dia+termo,
+    acumulado ao longo do tempo a partir dos comentarios ainda nao vistos."""
+    return _bulk(
+        """insert into daily_terms (day, subreddit, term, n)
+           values (%(day)s, %(subreddit)s, %(term)s, %(n)s)
+           on conflict (day, subreddit, term) do update
+             set n = daily_terms.n + excluded.n""",
+        rows)
+
+
+def term_frequencies(sub, window_hours, now=None, limit=200):
+    """Agregado persistido, cobre a janela toda (30/60/90d) igual as demais
+    metricas — ao contrario do texto ao vivo, que so sobrevive 7 dias."""
+    now = now or time.time()
+    return query(
+        """select term, sum(n) as n from daily_terms
+           where subreddit=%s and day>=%s
+           group by term order by n desc limit %s""",
+        (sub.lower(), now - window_hours * 3600, limit))
+
+
 def participation_stats(sub, window_hours, now=None):
     """Frequencia (comentarios), reconhecimento (curtidas) e quem inicia thread
     (parent_id t3_) vs so responde (t1_) — sinais que o grafo nao carrega."""

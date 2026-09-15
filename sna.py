@@ -254,32 +254,72 @@ def parse_mention_targets(body, source_author):
     return {m.lower() for m in MENTION_RE.findall(body) if m.lower() != src}
 
 
-def record_mentions(sub, now=None, lookback_hours=3):
+DAY = 86400
+
+
+def bucket_terms_by_day(rows, min_len=4):
+    """
+    Conta termos por dia a partir de comentarios (id, author, body,
+    created_utc) — pensado pra persistir em daily_terms, por isso agrega por
+    dia em vez de retornar so o top-N (isso fica a cargo de quem le depois).
+    """
+    counts = defaultdict(Counter)
+    for r in rows:
+        body = r.get("body")
+        if not body:
+            continue
+        day = int(r["created_utc"] // DAY) * DAY
+        for w in re.findall(r"[^\W\d_]+", body.lower()):
+            if len(w) >= min_len and w not in STOPWORDS:
+                counts[day][w] += 1
+    return counts
+
+
+def record_text_signals(sub, now=None, lookback_hours=3):
     """
     Roda a cada ciclo do cron (analyze.yml, a cada 30 min). Le so os
-    comentarios recentes com body ainda vivo e persiste o par
-    citante->citado em 'mentions' — pesa uma fracao do texto e nunca
-    precisa ser apagado, entao 'mencoes recebidas' cobre a janela inteira
-    (30/60/90d) igual as metricas de grafo, ao contrario do body em si.
-    lookback_hours>cadencia do cron da folga para o atraso de ingestao do
-    Arctic Shift; on conflict do nothing torna reprocessar a mesma fatia
-    inofensivo.
+    comentarios recentes com body ainda vivo e persiste dois sinais antes
+    que a retencao apague o texto:
+
+      - mencoes (par citante->citado) em 'mentions' — idempotente via PK
+        (comment_id, target_author), pode reprocessar a mesma fatia a vontade.
+      - frequencia de termo por dia em 'daily_terms' — agregado ADITIVO, por
+        isso precisa de terms_seen pra nao contar o mesmo comentario 2x entre
+        execucoes que se sobrepoem (lookback_hours > intervalo do cron, de
+        proposito, pra cobrir o atraso de ingestao do Arctic Shift).
+
+    Os dois pesam uma fracao do texto bruto e nunca precisam ser apagados,
+    entao cobrem a janela de analise inteira (30/60/90d) igual as metricas
+    de grafo, ao contrario do body em si.
     """
     now = now or time.time()
     rows = db.recent_comments_with_body(sub, lookback_hours, now)
-    out = [{"comment_id": r["id"], "subreddit": sub.lower(),
-            "source_author": r["author"], "target_author": t,
-            "created_utc": r["created_utc"]}
-           for r in rows for t in parse_mention_targets(r["body"], r["author"])]
-    n = db.upsert_mentions(out)
-    print(f"  mencoes: {n} pares novos (varredura de {lookback_hours}h)")
+
+    out_mentions = [{"comment_id": r["id"], "subreddit": sub.lower(),
+                      "source_author": r["author"], "target_author": t,
+                      "created_utc": r["created_utc"]}
+                     for r in rows for t in parse_mention_targets(r["body"], r["author"])]
+    n_mentions = db.upsert_mentions(out_mentions)
+
+    novos_ids = db.unseen_comment_ids([r["id"] for r in rows])
+    frescos = [r for r in rows if r["id"] in novos_ids]
+    by_day = bucket_terms_by_day(frescos)
+    out_terms = [{"day": day, "subreddit": sub.lower(), "term": term, "n": n}
+                 for day, counter in by_day.items() for term, n in counter.items()]
+    n_terms = db.upsert_daily_terms(out_terms)
+    db.mark_terms_seen(novos_ids, now)
+
+    print(f"  sinais de texto: {n_mentions} mencoes, {n_terms} termos/dia "
+          f"({len(frescos)} comentarios novos, varredura de {lookback_hours}h)")
 
 
 def top_terms(bodies, top_n=5, min_len=4):
     """
-    Frequencia de palavras cruas como pista extra de topico, ao lado do flair.
-    Heuristica de stopwords, nao e NLP de verdade — mesma limitacao de
-    cobertura de extract_mentions (so corpos nao apagados pela retencao).
+    Top-N de frequencia de palavras cruas sobre texto ao vivo (nao persistido)
+    — usado só pelo filtro "por tribo" da nuvem de palavras, que precisa da
+    community ao vivo e por isso fica limitado aos ~7 dias em que o body
+    ainda existe (ver daily_terms/record_text_signals para a versao que
+    cobre a janela inteira). Heuristica de stopwords, nao e NLP de verdade.
     """
     counts = Counter()
     for b in bodies:
@@ -381,9 +421,9 @@ if __name__ == "__main__":
     ap.add_argument("--no-prune", action="store_true")
     ap.add_argument("--skip-mentions", action="store_true")
     ap.add_argument("--mentions-lookback", type=int, default=3,
-                     help="horas varridas por record_mentions; use um valor "
-                          "alto (ex: 168) uma unica vez para semear o "
-                          "historico atual antes que o body expire")
+                     help="horas varridas por record_text_signals (mencoes + "
+                          "termos/dia); use um valor alto (ex: 168) uma unica "
+                          "vez para semear o historico atual antes que o body expire")
     a = ap.parse_args()
     if not a.sub:
         sys.exit("informe --sub ou defina TARGET_SUBREDDIT")
@@ -395,7 +435,7 @@ if __name__ == "__main__":
         for w in WINDOWS:
             snapshot(a.sub, proj, w, now=t)
     if not a.skip_mentions:
-        record_mentions(a.sub, now=t, lookback_hours=a.mentions_lookback)
+        record_text_signals(a.sub, now=t, lookback_hours=a.mentions_lookback)
     if not a.no_prune:
         db.prune()
     print(f"banco: {db.db_size_mb()} MB / 500 MB")

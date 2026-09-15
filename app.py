@@ -7,7 +7,6 @@ Em Settings > Secrets, cole:  DATABASE_URL = "postgresql://..."
 """
 import time
 import math
-import numpy as np
 import pandas as pd
 import networkx as nx
 import plotly.graph_objects as go
@@ -407,46 +406,32 @@ st.dataframe(
         "posts_engajamento": "engajamento gerado (posts)",
         "w_in_degree": "respostas recebidas", "líder": "líder da tribo"})
 
-st.subheader("Nuvem de palavras do subreddit")
-st.caption("Termos mais citados nos comentários de todas as tribos, tamanho "
-           "proporcional à frequência. Mesma cobertura de 7 dias do texto "
-           "explicada acima — não é a janela de 30/60/90 dias selecionada.")
+st.subheader("Nuvem de palavras")
 
-def _tom_academico(word, font_size, position, orientation, random_state=None, **kwargs):
-    # Azul-marinho mais escuro para palavras mais citadas (font_size maior),
-    # em vez de cor aleatoria por palavra — a cor passa a carregar informacao
-    # (frequencia), no lugar do efeito "confete" do colormap padrao.
-    t = min(font_size / 100, 1.0)
-    r = int(15 + (1 - t) * 90)
-    g = int(35 + (1 - t) * 90)
-    b = int(90 + (1 - t) * 80)
-    return f"rgb({r}, {g}, {b})"
+col_escopo, col_n = st.columns([2, 1])
+with col_escopo:
+    escopo = st.selectbox(
+        "Escopo", ["Todo o subreddit"] + sorted({t["tribo"] for t in tribos_info}))
+with col_n:
+    n_palavras = st.slider("Número de palavras", 20, 150, 80, step=10)
 
-def _fonte_serifada():
-    # wordcloud ja depende de matplotlib, entao a DejaVu Serif dele vem de
-    # graca — sem baixar/versionar fonte pra sair do sans-serif padrao.
-    try:
-        import matplotlib.font_manager as fm
-        return fm.findfont(fm.FontProperties(family="serif", weight="bold"))
-    except Exception:
-        return None
+if escopo == "Todo o subreddit":
+    freqs = {r["term"]: r["n"] for r in db.term_frequencies(SUB, WIN, limit=200)}
+    st.caption(f"Termos acumulados dia a dia desde que este recurso entrou no ar, "
+               f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
+else:
+    comm_ids = at.loc[at["tribo"] == escopo, "community"].unique()
+    bodies = [r["body"] for r in text_rows if comm_of.get(r["author"]) in comm_ids]
+    freqs = dict(sna.top_terms(bodies, top_n=200))
+    st.caption("Por tribo usa o texto ao vivo, que só sobrevive 7 dias na retenção do "
+               "banco — não é a janela de 30/60/90 dias selecionada.")
 
-freqs = dict(sna.top_terms([r["body"] for r in text_rows], top_n=80))
 if freqs:
-    h, w = 420, 1000
-    yy, xx = np.ogrid[:h, :w]
-    dentro_da_elipse = ((xx - w / 2) / (w / 2)) ** 2 + ((yy - h / 2) / (h / 2)) ** 2 <= 1
-    mascara = np.full((h, w), 255, dtype=np.uint8)
-    mascara[dentro_da_elipse] = 0
-
-    nuvem = WordCloud(mask=mascara, background_color="white", font_path=_fonte_serifada(),
-                       max_font_size=110, min_font_size=10, relative_scaling=0.55,
-                       prefer_horizontal=1.0, color_func=_tom_academico
-                       ).generate_from_frequencies(freqs)
+    nuvem = WordCloud(width=1000, height=460, background_color="white",
+                       colormap="Dark2", max_words=n_palavras, relative_scaling=0.4,
+                       prefer_horizontal=0.95).generate_from_frequencies(freqs)
     with st.container(border=True):
         st.image(nuvem.to_array(), width="stretch")
-        st.caption(f"Figura — nuvem de palavras de r/{SUB}, últimos 7 dias com texto "
-                   f"disponível (N = {len(text_rows)} comentários). Tom mais escuro = "
-                   f"termo mais citado.")
+        st.caption(f"Figura — nuvem de palavras de r/{SUB} ({escopo.lower()}).")
 else:
-    st.caption("Sem texto suficiente nos últimos 7 dias para montar a nuvem.")
+    st.caption("Sem dado suficiente ainda para montar a nuvem.")
