@@ -375,12 +375,15 @@ for _, grp in com_tribo.groupby("community"):
     tribos_info.append({"tribo": grp["tribo"].iloc[0], "membros": len(grp), "líder": lider})
 isolados = int((at["community"] == -1).sum())
 
-cols = st.columns(max(len(tribos_info), 1) + (1 if isolados else 0))
-for i, info in enumerate(tribos_info):
-    cols[i].metric(info["tribo"], f'{info["membros"]} membros',
-                   help=f'líder: u/{info["líder"]}')
-if isolados:
-    cols[len(tribos_info)].metric("Sem tribo definida", f"{isolados} membros")
+# Tabela, nao st.metric em colunas: com muitas tribos pequenas (comum quando
+# o flair varia bastante), colunas lado a lado truncam o rotulo pra "E."/"D."
+# e ficam ilegiveis. Uma tabela escala pra qualquer numero de tribos.
+resumo = tribos_info + (
+    [{"tribo": "Sem tribo definida", "membros": isolados, "líder": "—"}] if isolados else [])
+st.dataframe(
+    pd.DataFrame(resumo).sort_values("membros", ascending=False),
+    hide_index=True, width="stretch",
+    column_config={"tribo": "tribo", "membros": "membros", "líder": "líder"})
 
 opcoes = ["Todas"] + sorted({t["tribo"] for t in tribos_info}) + (
     ["Sem tribo definida"] if isolados else [])
@@ -392,7 +395,7 @@ st.dataframe(
         ["author", "tribo", "papel", "comentarios", "curtidas",
          "mencoes_recebidas", "iniciador_pct", "posts_engajamento",
          "w_in_degree", "coreness", "líder"]],
-    use_container_width=True, hide_index=True,
+    width="stretch", hide_index=True,
     column_config={
         "author": "autor", "comentarios": "comentários",
         "curtidas": "curtidas (score)", "mencoes_recebidas": "menções recebidas",
