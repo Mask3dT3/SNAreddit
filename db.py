@@ -100,6 +100,102 @@ def save_actor_snapshots(rows):
         rows)
 
 
+_BOTS = ("AutoModerator", "[deleted]", "")
+_BOTS_LOWER = ("automoderator", "[deleted]")   # target_author e guardado minusculo
+
+
+def recent_comments_with_body(sub, lookback_hours, now=None):
+    """Fatia curta e recente, usada so pela extracao de mencoes a cada run do
+    cron — nao e a janela de analise (WIN), e so a novidade desde o ultimo run."""
+    now = now or time.time()
+    return query(
+        """select id, author, body, created_utc from comments
+           where subreddit=%s and created_utc>=%s
+             and body is not null and author is not null""",
+        (sub.lower(), now - lookback_hours * 3600))
+
+
+def upsert_mentions(rows):
+    return _bulk(
+        """insert into mentions
+             (comment_id, subreddit, source_author, target_author, created_utc)
+           values (%(comment_id)s, %(subreddit)s, %(source_author)s,
+                   %(target_author)s, %(created_utc)s)
+           on conflict (comment_id, target_author) do nothing""",
+        rows)
+
+
+def mentions_received(sub, window_hours, now=None):
+    """Agregado persistido — ao contrario do body, nunca e apagado antes da
+    hora, entao cobre a janela toda (30/60/90d) igual as demais metricas."""
+    now = now or time.time()
+    return query(
+        """select target_author as author, count(*) as mencoes_recebidas
+           from mentions
+           where subreddit=%s and created_utc>=%s and target_author not in %s
+           group by target_author""",
+        (sub.lower(), now - window_hours * 3600, _BOTS_LOWER))
+
+
+def participation_stats(sub, window_hours, now=None):
+    """Frequencia (comentarios), reconhecimento (curtidas) e quem inicia thread
+    (parent_id t3_) vs so responde (t1_) — sinais que o grafo nao carrega."""
+    now = now or time.time()
+    return query(
+        """select author,
+                  count(*) as comentarios,
+                  coalesce(sum(score), 0) as curtidas,
+                  sum(case when parent_id like 't3_%%' then 1 else 0 end) as threads_iniciados,
+                  sum(case when parent_id like 't1_%%' then 1 else 0 end) as respostas_dadas
+           from comments
+           where subreddit=%s and created_utc>=%s and author is not null
+             and author not in %s
+           group by author""",
+        (sub.lower(), now - window_hours * 3600, _BOTS))
+
+
+def submission_stats(sub, window_hours, now=None):
+    """Engajamento gerado por quem abre posts: score e comentarios recebidos."""
+    now = now or time.time()
+    return query(
+        """select author,
+                  count(*) as posts,
+                  coalesce(sum(score), 0) as posts_score,
+                  coalesce(sum(num_comments), 0) as posts_engajamento
+           from submissions
+           where subreddit=%s and created_utc>=%s and author is not null
+             and author not in %s
+           group by author""",
+        (sub.lower(), now - window_hours * 3600, _BOTS))
+
+
+def mentionable_comments(sub, window_hours, now=None):
+    """
+    Corpo do comentario para mencao (u/fulano) e termos frequentes. So retorna
+    linhas com body != null — a retencao (schema.sql) zera o body com 7 dias,
+    entao em janelas maiores isto cobre so a fatia recente por construcao.
+    """
+    now = now or time.time()
+    return query(
+        """select author, body from comments
+           where subreddit=%s and created_utc>=%s
+             and body is not null and author is not null
+             and author not in %s""",
+        (sub.lower(), now - window_hours * 3600, _BOTS))
+
+
+def topic_signal(sub, window_hours, now=None):
+    """Flair dos posts que cada autor comentou — e o 'topico/hashtag' real do
+    Reddit, ao contrario da comunidade do Louvain, que e so estrutura."""
+    now = now or time.time()
+    return query(
+        """select c.author as author, s.flair as flair
+           from comments c join submissions s on s.id = c.submission_id
+           where c.subreddit=%s and c.created_utc>=%s and c.author is not null
+             and c.author not in %s and s.flair is not null""",
+        (sub.lower(), now - window_hours * 3600, _BOTS))
+
+
 def query(sql, params=()):
     with connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:

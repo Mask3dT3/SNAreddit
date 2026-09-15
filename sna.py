@@ -17,6 +17,7 @@ fracao de folhas): sao eles que dizem se as metricas daquela projecao
 significam algo naquele sub, naquela janela.
 """
 import os
+import re
 import sys
 import time
 import math
@@ -28,9 +29,22 @@ import networkx as nx
 import db
 
 BOTS = {"AutoModerator", "[deleted]", "None", None, ""}
-WINDOWS = (168, 720, 2160)          # 7d, 30d, 90d
+WINDOWS = (720, 1440, 2160)          # 30d, 60d, 90d
 PROJECTIONS = ("reply", "copart")
 MAX_THREAD = 40                      # threads maiores viram cliques que dominam tudo
+
+MENTION_RE = re.compile(r"(?<![\w/])/?u/([A-Za-z0-9_-]{3,20})", re.IGNORECASE)
+STOPWORDS = {
+    "que", "não", "nao", "com", "uma", "um", "para", "mais", "como", "por",
+    "isso", "essa", "esse", "muito", "também", "tambem", "você", "voce",
+    "ele", "ela", "eles", "elas", "mas", "ser", "estar", "tem", "tinha",
+    "foi", "são", "sao", "aqui", "ali", "pra", "pro", "tudo", "nada", "onde",
+    "quando", "porque", "assim", "sobre", "entre", "the", "and", "for",
+    "that", "this", "with", "have", "has", "are", "was", "but", "not",
+    "you", "your", "from", "just", "like", "what", "when", "how", "why",
+    "would", "could", "should", "will", "about", "there", "their", "them",
+    "then", "than", "been",
+}
 
 
 # ------------------------------------------------------------- construcao
@@ -199,6 +213,81 @@ def compute_metrics(G, betweenness_sample=400):
     return graph_m, actors
 
 
+def classify_engagement(coreness, max_core, comentarios):
+    """
+    Central = esta no k-core maximo (o nucleo mais denso da tribo).
+    Periferico = 2 comentarios ou menos na janela — aparece e some, o
+    criterio literal do enunciado (frequencia de participacao). Nao usa grau
+    do grafo de proposito: leaf_frac (compute_metrics) mede grau
+    nao-dirigido, que diverge de in_degree+out_degree para pares reciprocos.
+    Ativo = o resto.
+    """
+    if max_core and coreness >= max_core:
+        return "Central"
+    if comentarios <= 2:
+        return "Periférico"
+    return "Ativo"
+
+
+def parse_mention_targets(body, source_author):
+    """Alvos 'u/fulano' citados num comentario, minusculos, sem autocitacao."""
+    if not body:
+        return set()
+    src = (source_author or "").lower()
+    return {m.lower() for m in MENTION_RE.findall(body) if m.lower() != src}
+
+
+def record_mentions(sub, now=None, lookback_hours=3):
+    """
+    Roda a cada ciclo do cron (analyze.yml, a cada 30 min). Le so os
+    comentarios recentes com body ainda vivo e persiste o par
+    citante->citado em 'mentions' — pesa uma fracao do texto e nunca
+    precisa ser apagado, entao 'mencoes recebidas' cobre a janela inteira
+    (30/60/90d) igual as metricas de grafo, ao contrario do body em si.
+    lookback_hours>cadencia do cron da folga para o atraso de ingestao do
+    Arctic Shift; on conflict do nothing torna reprocessar a mesma fatia
+    inofensivo.
+    """
+    now = now or time.time()
+    rows = db.recent_comments_with_body(sub, lookback_hours, now)
+    out = [{"comment_id": r["id"], "subreddit": sub.lower(),
+            "source_author": r["author"], "target_author": t,
+            "created_utc": r["created_utc"]}
+           for r in rows for t in parse_mention_targets(r["body"], r["author"])]
+    n = db.upsert_mentions(out)
+    print(f"  mencoes: {n} pares novos (varredura de {lookback_hours}h)")
+
+
+def top_terms(bodies, top_n=5, min_len=4):
+    """
+    Frequencia de palavras cruas como pista extra de topico, ao lado do flair.
+    Heuristica de stopwords, nao e NLP de verdade — mesma limitacao de
+    cobertura de extract_mentions (so corpos nao apagados pela retencao).
+    """
+    counts = Counter()
+    for b in bodies:
+        if not b:
+            continue
+        for w in re.findall(r"[^\W\d_]+", b.lower()):
+            if len(w) >= min_len and w not in STOPWORDS:
+                counts[w] += 1
+    return counts.most_common(top_n)
+
+
+def tribe_topics(flair_rows, comm_of):
+    """
+    Rotulo de tribo pelo flair predominante entre os posts que a comunidade
+    comenta — e o equivalente real de 'topico/hashtag' que o Reddit tem,
+    diferente da comunidade do Louvain, que e so estrutura de interacao.
+    """
+    by_comm = defaultdict(Counter)
+    for r in flair_rows:
+        c = comm_of.get(r["author"])
+        if c is not None and c != -1 and r.get("flair"):
+            by_comm[c][r["flair"]] += 1
+    return {c: counter.most_common(1)[0][0] for c, counter in by_comm.items()}
+
+
 def count_new_authors(sub, window_hours, now=None):
     now = now or time.time()
     r = db.query(
@@ -273,6 +362,11 @@ if __name__ == "__main__":
     ap.add_argument("--sub", default=os.environ.get("TARGET_SUBREDDIT"))
     ap.add_argument("--projection", choices=list(PROJECTIONS) + ["all"], default="all")
     ap.add_argument("--no-prune", action="store_true")
+    ap.add_argument("--skip-mentions", action="store_true")
+    ap.add_argument("--mentions-lookback", type=int, default=3,
+                     help="horas varridas por record_mentions; use um valor "
+                          "alto (ex: 168) uma unica vez para semear o "
+                          "historico atual antes que o body expire")
     a = ap.parse_args()
     if not a.sub:
         sys.exit("informe --sub ou defina TARGET_SUBREDDIT")
@@ -283,6 +377,8 @@ if __name__ == "__main__":
     for proj in projs:
         for w in WINDOWS:
             snapshot(a.sub, proj, w, now=t)
+    if not a.skip_mentions:
+        record_mentions(a.sub, now=t, lookback_hours=a.mentions_lookback)
     if not a.no_prune:
         db.prune()
     print(f"banco: {db.db_size_mb()} MB / 500 MB")

@@ -57,6 +57,16 @@ def cold_data(sub, win, proj):
     return gs, actors
 
 
+@st.cache_data(ttl=300)
+def role_data(sub, win):
+    now = time.time()
+    return (pd.DataFrame(db.participation_stats(sub, win, now)),
+            pd.DataFrame(db.submission_stats(sub, win, now)),
+            pd.DataFrame(db.mentions_received(sub, win, now)),
+            db.mentionable_comments(sub, win, now),
+            db.topic_signal(sub, win, now))
+
+
 @st.cache_data(ttl=300, show_spinner="Montando o grafo...")
 def graph_layout(sub, win, proj, top_n=120):
     G = sna.BUILDERS[proj](sub, win)
@@ -76,8 +86,8 @@ if not subs:
 
 SUB = st.sidebar.selectbox("Subreddit", subs)
 WIN = st.sidebar.select_slider(
-    "Janela", options=[168, 720, 2160], value=720,
-    format_func=lambda h: {168: "7 dias", 720: "30 dias", 2160: "90 dias"}[h])
+    "Janela", options=[720, 1440, 2160], value=720,
+    format_func=lambda h: {720: "30 dias", 1440: "60 dias", 2160: "90 dias"}[h])
 PROJ = st.sidebar.radio(
     "Projeção do grafo", ["reply", "copart"],
     format_func=lambda p: {"reply": "Reply graph (quem responde quem)",
@@ -281,3 +291,122 @@ if res:
     fig.update_layout(height=430, showlegend=False, margin=dict(t=5, b=5, l=0, r=0),
                       xaxis=dict(visible=False), yaxis=dict(visible=False))
     st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+st.subheader("Tribos e lideranças")
+st.caption(
+    "Tribo = comunidade do Louvain, a mesma partição que colore o grafo acima "
+    "— comunidade -1 é quem ficou fora do componente gigante, sem tribo definida. "
+    "Papel de engajamento vem do k-core e do grau. Liderança combina respostas "
+    "recebidas, menções e engajamento gerado nos posts próprios.")
+
+part, subs_df, mentions_df, text_rows, flair_rows = role_data(SUB, WIN)
+
+at = actors.copy()
+
+if not part.empty:
+    at = at.merge(part, on="author", how="left")
+int_cols = ["comentarios", "curtidas", "threads_iniciados", "respostas_dadas"]
+for col in int_cols:
+    if col not in at:
+        at[col] = 0
+at[int_cols] = at[int_cols].fillna(0).astype(int)
+
+if not subs_df.empty:
+    at = at.merge(subs_df, on="author", how="left")
+int_cols = ["posts", "posts_score", "posts_engajamento"]
+for col in int_cols:
+    if col not in at:
+        at[col] = 0
+at[int_cols] = at[int_cols].fillna(0).astype(int)
+
+# Periferico usa comentarios (frequencia de participacao), nao grau do grafo:
+# leaf_frac (sna.py) mede grau nao-dirigido, que diverge do in+out_degree
+# dirigido para pares reciprocos — usar a mesma base de dado (comentarios)
+# em vez de tentar reproduzir leaf_frac evita esse descompasso.
+at["papel"] = [sna.classify_engagement(c, cur["max_core"], n)
+              for c, n in zip(at["coreness"], at["comentarios"])]
+
+iniciados = at["threads_iniciados"] + at["posts"]
+total_msgs = iniciados + at["respostas_dadas"]
+at["iniciador_pct"] = (iniciados / total_msgs.where(total_msgs > 0)).fillna(0)
+
+at["_author_lower"] = at["author"].str.lower()
+if not mentions_df.empty:
+    at = at.merge(mentions_df.rename(columns={"author": "_author_lower"}),
+                  on="_author_lower", how="left")
+if "mencoes_recebidas" not in at:
+    at["mencoes_recebidas"] = 0
+at["mencoes_recebidas"] = at["mencoes_recebidas"].fillna(0).astype(int)
+at.drop(columns="_author_lower", inplace=True)
+
+comm_of = dict(zip(at["author"], at["community"]))
+topics = sna.tribe_topics(flair_rows, comm_of)
+at["tribo"] = at["community"].map(
+    lambda c: "Sem tribo definida" if c == -1 else topics.get(c, f"Comunidade {c}"))
+
+score_cols = ["w_in_degree", "mencoes_recebidas", "posts_engajamento"]
+at["influência"] = at[score_cols].rank(pct=True).sum(axis=1)
+at["líder"] = False
+com_tribo = at[at["community"] != -1]
+for _, grp in com_tribo.groupby("community"):
+    at.loc[grp["influência"].idxmax(), "líder"] = True
+# Refatia depois de marcar lider: filtro booleano em pandas sempre copia, entao
+# o com_tribo de cima nao carrega o "líder" escrito em "at" no loop acima.
+com_tribo = at[at["community"] != -1]
+
+st.caption("Menções recebidas são extraídas e guardadas assim que o comentário "
+           "chega, então cobrem a janela inteira. Termos mais citados (no "
+           "expansor abaixo) continuam limitados aos últimos 7 dias — o corpo "
+           "do comentário é apagado depois disso pela política de retenção do "
+           "banco, e guardar toda palavra de todo comentário pesaria mais do "
+           "que o texto que essa retenção existe pra economizar.")
+if flair_rows and not any(topics.values()):
+    st.caption("Este subreddit não usa flair nos posts, então o nome da tribo "
+               "cai no número da comunidade.")
+
+tribos_info = []
+for _, grp in com_tribo.groupby("community"):
+    # Agrupa por community (id), nao por tribo (rotulo de flair): duas
+    # comunidades podem ter o mesmo flair predominante, e agrupar pelo rotulo
+    # as fundiria num card so, perdendo o lider de uma delas.
+    lider_row = grp[grp["líder"]]
+    lider = lider_row["author"].iloc[0] if not lider_row.empty else "—"
+    tribos_info.append({"tribo": grp["tribo"].iloc[0], "membros": len(grp), "líder": lider})
+isolados = int((at["community"] == -1).sum())
+
+cols = st.columns(max(len(tribos_info), 1) + (1 if isolados else 0))
+for i, info in enumerate(tribos_info):
+    cols[i].metric(info["tribo"], f'{info["membros"]} membros',
+                   help=f'líder: u/{info["líder"]}')
+if isolados:
+    cols[len(tribos_info)].metric("Sem tribo definida", f"{isolados} membros")
+
+opcoes = ["Todas"] + sorted({t["tribo"] for t in tribos_info}) + (
+    ["Sem tribo definida"] if isolados else [])
+filtro = st.selectbox("Filtrar por tribo", opcoes)
+tabela = at if filtro == "Todas" else at[at["tribo"] == filtro]
+
+st.dataframe(
+    tabela.sort_values("influência", ascending=False)[
+        ["author", "tribo", "papel", "comentarios", "curtidas",
+         "mencoes_recebidas", "iniciador_pct", "posts_engajamento",
+         "w_in_degree", "coreness", "líder"]],
+    use_container_width=True, hide_index=True,
+    column_config={
+        "author": "autor", "comentarios": "comentários",
+        "curtidas": "curtidas (score)", "mencoes_recebidas": "menções recebidas",
+        "iniciador_pct": st.column_config.NumberColumn(
+            "% inicia discussão", format="percent",
+            help="posts + comentários-raiz sobre o total de mensagens do autor"),
+        "posts_engajamento": "engajamento gerado (posts)",
+        "w_in_degree": "respostas recebidas", "líder": "líder da tribo"})
+
+if text_rows:
+    with st.expander("Termos mais citados por tribo (pista extra de tópico, cobertura de 7 dias)"):
+        for tribo in sorted(set(t["tribo"] for t in tribos_info)):
+            comm_ids = at.loc[at["tribo"] == tribo, "community"].unique()
+            bodies = [r["body"] for r in text_rows if comm_of.get(r["author"]) in comm_ids]
+            termos = sna.top_terms(bodies)
+            if termos:
+                st.markdown(f"**{tribo}**: " + ", ".join(w for w, _ in termos))

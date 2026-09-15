@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      mentions_lookback_hours:
+        description: >-
+          Horas retroativas varridas para extrair menções (u/fulano).
+          Use 168 UMA VEZ para semear o histórico atual antes que o texto
+          do comentário expire (retenção de 7 dias); deixe em branco nas
+          demais execuções.
+        required: false
+        default: ""
 
 concurrency:
   group: analyze
@@ -20,7 +29,13 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements-jobs.txt
-      - run: python sna.py
+      - run: |
+          if [ -n "$MENTIONS_LOOKBACK_HOURS" ]; then
+            python sna.py --mentions-lookback "$MENTIONS_LOOKBACK_HOURS"
+          else
+            python sna.py
+          fi
         env:
-          DATABASE_URL:     ${{ secrets.DATABASE_URL }}
-          TARGET_SUBREDDIT: ${{ vars.TARGET_SUBREDDIT }}
+          DATABASE_URL:            ${{ secrets.DATABASE_URL }}
+          TARGET_SUBREDDIT:        ${{ vars.TARGET_SUBREDDIT }}
+          MENTIONS_LOOKBACK_HOURS: ${{ github.event.inputs.mentions_lookback_hours }}

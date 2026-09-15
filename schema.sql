@@ -58,12 +58,27 @@ create table if not exists actor_snapshots (
     primary key (ts, window_hours, subreddit, author)
 );
 
+-- Mencoes 'u/fulano' extraidas do body assim que o comentario chega (job de
+-- analise, a cada 30 min). Guarda so o par citante->citado, nao o texto —
+-- por isso sobrevive a retencao do body (7 dias) e cobre a janela inteira
+-- (30/60/90 dias) igual as demais metricas.
+create table if not exists mentions (
+    comment_id     text not null,
+    subreddit      text not null,
+    source_author  text not null,
+    target_author  text not null,
+    created_utc    double precision not null,
+    primary key (comment_id, target_author)
+);
+
 create index if not exists idx_comments_created on comments(subreddit, created_utc);
 create index if not exists idx_comments_author  on comments(subreddit, author);
 create index if not exists idx_comments_parent  on comments(parent_id);
 create index if not exists idx_subs_created     on submissions(subreddit, created_utc);
 create index if not exists idx_actor_snap       on actor_snapshots(subreddit, window_hours, ts);
 create index if not exists idx_graph_snap       on graph_snapshots(subreddit, window_hours, ts);
+create index if not exists idx_mentions_target  on mentions(subreddit, target_author, created_utc);
+create index if not exists idx_mentions_created on mentions(created_utc);
 
 -- RETENCAO: sem isto o banco estoura os 500 MB.
 -- O texto do comentario e ~80% do peso da linha, mas o reply graph so precisa
@@ -81,5 +96,8 @@ begin
 
     delete from graph_snapshots
      where ts < extract(epoch from now()) - 365*86400;
+
+    delete from mentions
+     where created_utc < extract(epoch from now()) - 120*86400;
 end;
 $$ language plpgsql;
