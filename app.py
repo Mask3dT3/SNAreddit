@@ -411,11 +411,23 @@ st.caption("Termos mais citados nos comentários de todas as tribos, tamanho "
            "proporcional à frequência. Mesma cobertura de 7 dias do texto "
            "explicada acima — não é a janela de 30/60/90 dias selecionada.")
 
+def _tom_academico(word, font_size, position, orientation, random_state=None, **kwargs):
+    # Azul-marinho mais escuro para palavras mais citadas (font_size maior),
+    # em vez de cor aleatoria por palavra — a cor passa a carregar informacao
+    # (frequencia), no lugar do efeito "confete" do colormap padrao.
+    t = min(font_size / 100, 1.0)
+    r = int(15 + (1 - t) * 90)
+    g = int(35 + (1 - t) * 90)
+    b = int(90 + (1 - t) * 80)
+    return f"rgb({r}, {g}, {b})"
+
 freqs = dict(sna.top_terms([r["body"] for r in text_rows], top_n=80))
 if freqs:
-    nuvem = WordCloud(width=1000, height=380, background_color=None,
-                       mode="RGBA", colormap="plasma",
-                       prefer_horizontal=0.9).generate_from_frequencies(freqs)
-    st.image(nuvem.to_array(), width="stretch")
+    nuvem = WordCloud(width=1000, height=380, background_color="white",
+                       max_font_size=100, min_font_size=10,
+                       prefer_horizontal=1.0, color_func=_tom_academico
+                       ).generate_from_frequencies(freqs)
+    with st.container(border=True):
+        st.image(nuvem.to_array(), width="stretch")
 else:
     st.caption("Sem texto suficiente nos últimos 7 dias para montar a nuvem.")
