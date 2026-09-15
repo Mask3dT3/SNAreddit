@@ -11,6 +11,7 @@ import pandas as pd
 import networkx as nx
 import plotly.graph_objects as go
 import streamlit as st
+from wordcloud import WordCloud
 
 import db
 import sna
@@ -405,11 +406,16 @@ st.dataframe(
         "posts_engajamento": "engajamento gerado (posts)",
         "w_in_degree": "respostas recebidas", "líder": "líder da tribo"})
 
-if text_rows:
-    with st.expander("Termos mais citados por tribo (pista extra de tópico, cobertura de 7 dias)"):
-        for tribo in sorted(set(t["tribo"] for t in tribos_info)):
-            comm_ids = at.loc[at["tribo"] == tribo, "community"].unique()
-            bodies = [r["body"] for r in text_rows if comm_of.get(r["author"]) in comm_ids]
-            termos = sna.top_terms(bodies)
-            if termos:
-                st.markdown(f"**{tribo}**: " + ", ".join(w for w, _ in termos))
+st.subheader("Nuvem de palavras do subreddit")
+st.caption("Termos mais citados nos comentários de todas as tribos, tamanho "
+           "proporcional à frequência. Mesma cobertura de 7 dias do texto "
+           "explicada acima — não é a janela de 30/60/90 dias selecionada.")
+
+freqs = dict(sna.top_terms([r["body"] for r in text_rows], top_n=80))
+if freqs:
+    nuvem = WordCloud(width=1000, height=380, background_color=None,
+                       mode="RGBA", colormap="plasma",
+                       prefer_horizontal=0.9).generate_from_frequencies(freqs)
+    st.image(nuvem.to_array(), width="stretch")
+else:
+    st.caption("Sem texto suficiente nos últimos 7 dias para montar a nuvem.")
