@@ -122,13 +122,18 @@ _BOTS_LOWER = ("automoderator", "[deleted]")   # target_author e guardado minusc
 
 
 def recent_comments_with_body(sub, lookback_hours, now=None):
-    """Fatia curta e recente, usada so pela extracao de mencoes a cada run do
-    cron — nao e a janela de analise (WIN), e so a novidade desde o ultimo run."""
+    """
+    Fatia curta e recente, usada so pela extracao de sinais de texto a cada
+    run do cron — nao e a janela de analise (WIN), e so a novidade desde o
+    ultimo run. Traz o flair do post via join porque daily_terms persiste
+    por flair (estavel entre dias), nao por community do Louvain (instavel).
+    """
     now = now or time.time()
     return query(
-        """select id, author, body, created_utc from comments
-           where subreddit=%s and created_utc>=%s
-             and body is not null and author is not null""",
+        """select c.id, c.author, c.body, c.created_utc, s.flair as flair
+           from comments c left join submissions s on s.id = c.submission_id
+           where c.subreddit=%s and c.created_utc>=%s
+             and c.body is not null and c.author is not null""",
         (sub.lower(), now - lookback_hours * 3600))
 
 
@@ -173,20 +178,53 @@ def mark_terms_seen(ids, now):
 
 
 def upsert_daily_terms(rows):
-    """Soma no que ja existe (nao substitui) — cada linha e um dia+termo,
+    """Soma no que ja existe (nao substitui) — cada linha e um dia+flair+termo,
     acumulado ao longo do tempo a partir dos comentarios ainda nao vistos."""
     return _bulk(
-        """insert into daily_terms (day, subreddit, term, n)
-           values (%(day)s, %(subreddit)s, %(term)s, %(n)s)
-           on conflict (day, subreddit, term) do update
+        """insert into daily_terms (day, subreddit, flair, term, n)
+           values (%(day)s, %(subreddit)s, %(flair)s, %(term)s, %(n)s)
+           on conflict (day, subreddit, flair, term) do update
              set n = daily_terms.n + excluded.n""",
         rows)
 
 
-def term_frequencies(sub, window_hours, now=None, limit=200):
-    """Agregado persistido, cobre a janela toda (30/60/90d) igual as demais
-    metricas — ao contrario do texto ao vivo, que so sobrevive 7 dias."""
+def subreddit_flairs(sub):
+    """Flairs reais dos posts do sub — eixo estavel pra escopo da nuvem de
+    palavras, ao contrario da community do Louvain (recalculada a cada
+    snapshot, sem garantia de que o id 3 de hoje seja o id 3 de ontem)."""
+    return [r["flair"] for r in query(
+        "select distinct flair from submissions where subreddit=%s and flair is not null order by 1",
+        (sub.lower(),))]
+
+
+def submission_titles(sub, window_hours, now=None, flair=None):
+    """Titulo dos posts nunca e apagado (so o body do comentario tem
+    retencao), entao cobre a janela inteira desde sempre — sem precisar de
+    acumulo dia a dia como daily_terms."""
     now = now or time.time()
+    cutoff = now - window_hours * 3600
+    if flair is None:
+        return query(
+            """select title from submissions
+               where subreddit=%s and created_utc>=%s and author not in %s""",
+            (sub.lower(), cutoff, _BOTS))
+    return query(
+        """select title from submissions
+           where subreddit=%s and created_utc>=%s and author not in %s and flair=%s""",
+        (sub.lower(), cutoff, _BOTS, flair))
+
+
+def term_frequencies(sub, window_hours, now=None, limit=200, flair=None):
+    """Agregado persistido, cobre a janela toda (30/60/90d) igual as demais
+    metricas — ao contrario do texto ao vivo, que so sobrevive 7 dias.
+    flair=None soma todos os flairs (escopo 'todo o subreddit')."""
+    now = now or time.time()
+    if flair is not None:
+        return query(
+            """select term, sum(n) as n from daily_terms
+               where subreddit=%s and day>=%s and flair=%s
+               group by term order by n desc limit %s""",
+            (sub.lower(), now - window_hours * 3600, flair, limit))
     return query(
         """select term, sum(n) as n from daily_terms
            where subreddit=%s and day>=%s

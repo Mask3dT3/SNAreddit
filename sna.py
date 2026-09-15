@@ -61,7 +61,35 @@ STOPWORDS = {
     "are", "was", "but", "not", "you", "your", "from", "just", "like",
     "what", "when", "how", "why", "would", "could", "should", "will",
     "about", "there", "their", "them", "then", "than", "been",
+    # especifico do dominio Reddit — nao diz nada sobre o conteudo da tribo
+    "reddit", "subreddit", "http", "https", "www", "com",
 }
+
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")   # [texto](url) -> mantem so o texto
+
+
+def _tokenize(body, min_len=4):
+    """
+    Tokenizador comum a top_terms/bucket_terms_by_day. Tira link (markdown e
+    cru) antes de separar palavra — sem isso, fragmento de URL (dominio,
+    slug) vaza como "palavra" na nuvem, mesmo com 'https'/'www' na stopword.
+    """
+    if not body:
+        return []
+    body = MD_LINK_RE.sub(r"\1", body)
+    body = URL_RE.sub(" ", body)
+    return [w for w in re.findall(r"[^\W\d_]+", body.lower())
+            if len(w) >= min_len and w not in STOPWORDS]
+
+
+def word_frequencies(bodies, min_len=4):
+    """Contagem completa (sem cortar em top-N) — usada quando o chamador
+    precisa somar com outra fonte de texto antes de decidir o corte."""
+    counts = Counter()
+    for b in bodies:
+        counts.update(_tokenize(b, min_len))
+    return counts
 
 
 # ------------------------------------------------------------- construcao
@@ -255,23 +283,27 @@ def parse_mention_targets(body, source_author):
 
 
 DAY = 86400
+SEM_FLAIR = "Sem flair"
 
 
 def bucket_terms_by_day(rows, min_len=4):
     """
-    Conta termos por dia a partir de comentarios (id, author, body,
-    created_utc) — pensado pra persistir em daily_terms, por isso agrega por
-    dia em vez de retornar so o top-N (isso fica a cargo de quem le depois).
+    Conta termos por (dia, flair) a partir de comentarios (id, author, body,
+    created_utc, flair opcional do post) — pensado pra persistir em
+    daily_terms, por isso agrega em vez de retornar so o top-N (isso fica a
+    cargo de quem le depois). flair por comunidade nao daria pra persistir
+    (Louvain recalcula os ids a cada snapshot, sem estabilidade entre dias),
+    mas o flair do post e um valor estavel — por isso ele, e nao a
+    comunidade, e o eixo persistido.
     """
     counts = defaultdict(Counter)
     for r in rows:
-        body = r.get("body")
-        if not body:
+        words = _tokenize(r.get("body"), min_len)
+        if not words:
             continue
         day = int(r["created_utc"] // DAY) * DAY
-        for w in re.findall(r"[^\W\d_]+", body.lower()):
-            if len(w) >= min_len and w not in STOPWORDS:
-                counts[day][w] += 1
+        flair = r.get("flair") or SEM_FLAIR
+        counts[(day, flair)].update(words)
     return counts
 
 
@@ -303,9 +335,11 @@ def record_text_signals(sub, now=None, lookback_hours=3):
 
     novos_ids = db.unseen_comment_ids([r["id"] for r in rows])
     frescos = [r for r in rows if r["id"] in novos_ids]
-    by_day = bucket_terms_by_day(frescos)
-    out_terms = [{"day": day, "subreddit": sub.lower(), "term": term, "n": n}
-                 for day, counter in by_day.items() for term, n in counter.items()]
+    by_day_flair = bucket_terms_by_day(frescos)
+    out_terms = [{"day": day, "subreddit": sub.lower(), "flair": flair,
+                  "term": term, "n": n}
+                 for (day, flair), counter in by_day_flair.items()
+                 for term, n in counter.items()]
     n_terms = db.upsert_daily_terms(out_terms)
     db.mark_terms_seen(novos_ids, now)
 
@@ -321,14 +355,7 @@ def top_terms(bodies, top_n=5, min_len=4):
     ainda existe (ver daily_terms/record_text_signals para a versao que
     cobre a janela inteira). Heuristica de stopwords, nao e NLP de verdade.
     """
-    counts = Counter()
-    for b in bodies:
-        if not b:
-            continue
-        for w in re.findall(r"[^\W\d_]+", b.lower()):
-            if len(w) >= min_len and w not in STOPWORDS:
-                counts[w] += 1
-    return counts.most_common(top_n)
+    return word_frequencies(bodies, min_len).most_common(top_n)
 
 
 def tribe_topics(flair_rows, comm_of):

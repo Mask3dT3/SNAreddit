@@ -71,18 +71,21 @@ create table if not exists mentions (
     primary key (comment_id, target_author)
 );
 
--- Frequencia de termo por dia, extraida do body assim que o comentario
+-- Frequencia de termo por dia+flair, extraida do body assim que o comentario
 -- chega (mesmo job das mencoes). Agregado por DIA, nao por comentario —
--- por isso pesa uma fracao do texto bruto mesmo cobrindo 90 dias. A nuvem
--- de palavras soma os dias dentro da janela escolhida, igual as demais
--- metricas. terms_seen evita contar o mesmo comentario 2x entre execucoes
--- do cron que se sobrepoem.
+-- por isso pesa uma fracao do texto bruto mesmo cobrindo 90 dias. Persistido
+-- por FLAIR (estavel entre execucoes), nao por community do Louvain
+-- (recalculada a cada snapshot, sem garantia de que o id 3 de hoje seja o
+-- id 3 de ontem). A nuvem de palavras soma os dias/flairs dentro da janela
+-- escolhida, igual as demais metricas. terms_seen evita contar o mesmo
+-- comentario 2x entre execucoes do cron que se sobrepoem.
 create table if not exists daily_terms (
     day        double precision not null,
     subreddit  text not null,
+    flair      text not null default 'Sem flair',
     term       text not null,
     n          integer not null default 0,
-    primary key (day, subreddit, term)
+    primary key (day, subreddit, flair, term)
 );
 
 create table if not exists terms_seen (
@@ -90,7 +93,7 @@ create table if not exists terms_seen (
     seen_utc    double precision not null
 );
 
-create index if not exists idx_daily_terms_sub_day on daily_terms(subreddit, day);
+create index if not exists idx_daily_terms_sub_flair_day on daily_terms(subreddit, flair, day);
 
 create index if not exists idx_comments_created on comments(subreddit, created_utc);
 create index if not exists idx_comments_author  on comments(subreddit, author);

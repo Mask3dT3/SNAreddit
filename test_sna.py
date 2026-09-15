@@ -70,8 +70,57 @@ class TopTermsTest(unittest.TestCase):
     def test_lista_vazia_nao_quebra(self):
         self.assertEqual(sna.top_terms([], top_n=20), [])
 
+    def test_remove_url_crua(self):
+        termos = dict(sna.top_terms(
+            ["veja https://exemplo.com/artigo-legal e www.outro.com/pagina, aprender inglês"],
+            top_n=20))
+        for lixo in ("https", "exemplo", "com", "www", "outro", "artigo", "pagina"):
+            self.assertNotIn(lixo, termos)
+        self.assertIn("aprender", termos)
+
+    def test_remove_link_markdown_mas_mantem_o_texto(self):
+        termos = dict(sna.top_terms(
+            ["olha [este curso incrível](https://exemplo.com/curso) que eu achei"], top_n=20))
+        self.assertIn("curso", termos)
+        self.assertIn("incrível", termos)
+        self.assertNotIn("exemplo", termos)
+
+    def test_reddit_e_subreddit_sao_stopword(self):
+        termos = dict(sna.top_terms(["uso muito o reddit para aprender, ótimo subreddit"], top_n=20))
+        self.assertNotIn("reddit", termos)
+        self.assertNotIn("subreddit", termos)
+
+
+class WordFrequenciesTest(unittest.TestCase):
+    def test_nao_corta_em_top_n(self):
+        unicas = ["banana", "laranja", "manga", "coco", "melancia",
+                  "abacaxi", "morango", "kiwi", "goiaba", "ameixa"]
+        bodies = [f"{palavra} aprender" for palavra in unicas]
+        freqs = sna.word_frequencies(bodies)
+        self.assertEqual(freqs["aprender"], 10)
+        self.assertEqual(len(freqs), 11)  # 10 unicas + "aprender"
+
 
 class BucketTermsByDayTest(unittest.TestCase):
+    def test_agrupa_por_dia_e_flair(self):
+        rows = [
+            {"author": "a", "body": "python é ótimo", "created_utc": 1_700_000_000.0, "flair": "Python"},
+            {"author": "b", "body": "python ajuda muito", "created_utc": 1_700_000_100.0, "flair": "Python"},
+            {"author": "c", "body": "design também é legal", "created_utc": 1_700_000_200.0, "flair": "Design"},
+            {"author": "d", "body": "outro dia, outro assunto", "created_utc": 1_700_100_000.0, "flair": "Python"},
+        ]
+        by_day_flair = sna.bucket_terms_by_day(rows)
+        # 2 dias x ate 2 flairs no primeiro dia = 3 baldes (Python/dia1, Design/dia1, Python/dia2)
+        self.assertEqual(len(by_day_flair), 3)
+        self.assertIn((1_700_000_000 // sna.DAY * sna.DAY, "Python"), by_day_flair)
+        self.assertIn((1_700_000_000 // sna.DAY * sna.DAY, "Design"), by_day_flair)
+
+    def test_sem_flair_cai_no_sentinel(self):
+        rows = [{"author": "a", "body": "sem flair aqui, python", "created_utc": 1_700_000_000.0}]
+        by_day_flair = sna.bucket_terms_by_day(rows)
+        chave = next(iter(by_day_flair))
+        self.assertEqual(chave[1], sna.SEM_FLAIR)
+
     def test_agrupa_por_dia(self):
         rows = [
             {"author": "a", "body": "python é ótimo", "created_utc": 1_700_000_000.0},

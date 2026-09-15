@@ -8,6 +8,8 @@ Em Settings > Secrets, cole:  DATABASE_URL = "postgresql://..."
 import io
 import time
 import math
+from collections import Counter
+
 import pandas as pd
 import networkx as nx
 import plotly.graph_objects as go
@@ -60,8 +62,18 @@ def cold_data(sub, win, proj):
 
 
 @st.cache_data(ttl=300)
-def term_freqs_data(sub, win):
-    return db.term_frequencies(sub, win, limit=200)
+def term_freqs_data(sub, win, flair=None):
+    return db.term_frequencies(sub, win, limit=200, flair=flair)
+
+
+@st.cache_data(ttl=300)
+def title_freqs_data(sub, win, flair=None):
+    return db.submission_titles(sub, win, flair=flair)
+
+
+@st.cache_data(ttl=300)
+def flairs_data(sub):
+    return db.subreddit_flairs(sub)
 
 
 @st.cache_data(ttl=300)
@@ -433,23 +445,47 @@ st.download_button(
 
 st.subheader("Nuvem de palavras")
 
-col_escopo, col_n = st.columns([2, 1])
-with col_escopo:
-    escopo = st.selectbox(
-        "Escopo", ["Todo o subreddit"] + sorted({t["tribo"] for t in tribos_info}))
+col_eixo, col_n = st.columns([2, 1])
+with col_eixo:
+    eixo = st.selectbox("Nuvem de", ["Todo o subreddit", "Por flair", "Por tribo (estrutural)"],
+                        help="Flair é um rótulo estável do post (ex: 'Dúvida de Inglês'), "
+                             "cobre a janela toda. Tribo é a comunidade do Louvain — muda "
+                             "de id a cada execução do cron, então só dá pra usar com o "
+                             "texto ao vivo (7 dias).")
 with col_n:
     n_palavras = st.slider("Número de palavras", 20, 150, 80, step=10)
 
-if escopo == "Todo o subreddit":
-    freqs = {r["term"]: r["n"] for r in term_freqs_data(SUB, WIN)}
-    st.caption(f"Termos acumulados dia a dia desde que este recurso entrou no ar, "
-               f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
-else:
-    comm_ids = at.loc[at["tribo"] == escopo, "community"].unique()
+freqs, rotulo = {}, "todo o subreddit"
+
+if eixo == "Por tribo (estrutural)":
+    tribo_escolhida = st.selectbox("Tribo", sorted({t["tribo"] for t in tribos_info}))
+    comm_ids = at.loc[at["tribo"] == tribo_escolhida, "community"].unique()
     bodies = [r["body"] for r in text_rows if comm_of.get(r["author"]) in comm_ids]
     freqs = dict(sna.top_terms(bodies, top_n=200))
-    st.caption("Por tribo usa o texto ao vivo, que só sobrevive 7 dias na retenção do "
-               "banco — não é a janela de 30/60/90 dias selecionada.")
+    rotulo = f"tribo {tribo_escolhida}"
+    st.caption("Tribo (Louvain) muda de id a cada execução do cron, então esta opção usa "
+               "só o texto ao vivo — sobrevive 7 dias na retenção do banco, não é a "
+               "janela de 30/60/90 dias selecionada.")
+
+elif eixo == "Por flair":
+    flairs = flairs_data(SUB)
+    if not flairs:
+        st.caption("Este subreddit não usa flair nos posts.")
+    else:
+        flair_escolhido = st.selectbox("Flair", flairs)
+        comentarios = Counter({r["term"]: r["n"] for r in term_freqs_data(SUB, WIN, flair=flair_escolhido)})
+        titulos = sna.word_frequencies([r["title"] for r in title_freqs_data(SUB, WIN, flair=flair_escolhido)])
+        freqs = dict(comentarios + titulos)
+        rotulo = f"flair {flair_escolhido}"
+        st.caption(f"Comentários (acumulados dia a dia) + títulos de post com este flair, "
+                   f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
+
+else:  # Todo o subreddit
+    comentarios = Counter({r["term"]: r["n"] for r in term_freqs_data(SUB, WIN)})
+    titulos = sna.word_frequencies([r["title"] for r in title_freqs_data(SUB, WIN)])
+    freqs = dict(comentarios + titulos)
+    st.caption(f"Comentários (acumulados dia a dia) + títulos de post de todos os flairs, "
+               f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
 
 if freqs:
     nuvem = WordCloud(width=1000, height=460, background_color="white",
@@ -457,12 +493,12 @@ if freqs:
                        prefer_horizontal=0.95).generate_from_frequencies(freqs)
     with st.container(border=True):
         st.image(nuvem.to_array(), width="stretch")
-        st.caption(f"Figura — nuvem de palavras de r/{SUB} ({escopo.lower()}).")
+        st.caption(f"Figura — nuvem de palavras de r/{SUB} ({rotulo}).")
 
     png_buf = io.BytesIO()
     nuvem.to_image().save(png_buf, format="PNG")
     st.download_button(
         "Baixar nuvem (PNG)", png_buf.getvalue(),
-        file_name=f"{SUB}_nuvem_{escopo.lower().replace(' ', '_')}.png", mime="image/png")
+        file_name=f"{SUB}_nuvem_{rotulo.replace(' ', '_')}.png", mime="image/png")
 else:
     st.caption("Sem dado suficiente ainda para montar a nuvem.")
