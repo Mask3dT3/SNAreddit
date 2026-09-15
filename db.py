@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 
 def _dsn():
@@ -24,9 +25,25 @@ def _dsn():
     return url
 
 
+_pool = None
+
+
+def _get_pool():
+    # Lazy: so abre conexao quando a primeira query realmente roda. No
+    # dashboard (processo longo, muitos reruns) isto poupa handshake
+    # repetido; no cron (processo curto) o pool e descartado no fim do
+    # script, mas ainda poupa dentro das varias chamadas de uma mesma
+    # execucao (snapshot() roda por janela x projecao + record_text_signals).
+    global _pool
+    if _pool is None:
+        _pool = psycopg2.pool.ThreadedConnectionPool(1, 5, dsn=_dsn(), connect_timeout=15)
+    return _pool
+
+
 @contextmanager
 def connect():
-    conn = psycopg2.connect(_dsn(), connect_timeout=15)
+    pool = _get_pool()
+    conn = pool.getconn()
     try:
         yield conn
         conn.commit()
@@ -34,7 +51,7 @@ def connect():
         conn.rollback()
         raise
     finally:
-        conn.close()
+        pool.putconn(conn)
 
 
 def _bulk(sql, rows, page=500):

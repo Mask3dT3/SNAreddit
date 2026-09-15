@@ -5,6 +5,7 @@ exceto o layout de visualizacao, que fica em cache por 5 minutos.
 Deploy: Streamlit Community Cloud, apontando para este repo.
 Em Settings > Secrets, cole:  DATABASE_URL = "postgresql://..."
 """
+import io
 import time
 import math
 import pandas as pd
@@ -78,10 +79,11 @@ def graph_layout(sub, win, proj, top_n=120):
     G = sna.BUILDERS[proj](sub, win)
     if G.number_of_nodes() < 3:
         return None
+    total = G.number_of_nodes()
     keep = sorted(G.nodes(), key=lambda v: -G.degree(v, weight="weight"))[:top_n]
     H = G.subgraph(keep).copy()
     pos = nx.spring_layout(H, k=1.6 / math.sqrt(max(len(H), 1)), seed=42, iterations=60)
-    return list(H.edges()), {v: (float(p[0]), float(p[1])) for v, p in pos.items()}
+    return list(H.edges()), {v: (float(p[0]), float(p[1])) for v, p in pos.items()}, total
 
 
 # ------------------------------------------------------------------ layout
@@ -173,6 +175,9 @@ if actors.empty:
 
 cur = gs.iloc[-1]
 prev = gs.iloc[-2] if len(gs) > 1 else cur
+
+st.caption(f"Última análise: {pd.to_datetime(cur['ts'], unit='s'):%d/%m/%Y %H:%M} UTC "
+           f"· janela de {WIN // 24} dias · projeção {PROJ}")
 
 st.subheader("Confiabilidade estrutural")
 st.caption("Estes quatro números dizem se as métricas abaixo significam algo "
@@ -283,7 +288,9 @@ with td:
 st.subheader("Reply graph" if PROJ == "reply" else "Grafo de co-participação")
 res = graph_layout(SUB, WIN, PROJ)
 if res:
-    edges, pos = res
+    edges, pos, total_nos = res
+    if total_nos > len(pos):
+        st.caption(f"Mostrando os {len(pos)} participantes mais conectados de {total_nos}.")
     comm = dict(zip(actors["author"], actors["community"]))
     prk = dict(zip(actors["author"], actors["pagerank"]))
     ex, ey = [], []
@@ -420,6 +427,10 @@ st.dataframe(
         "posts_engajamento": "engajamento gerado (posts)",
         "w_in_degree": "respostas recebidas", "líder": "líder da tribo"})
 
+st.download_button(
+    "Baixar tabela (CSV)", tabela.to_csv(index=False).encode("utf-8"),
+    file_name=f"{SUB}_tribos_liderancas_{WIN // 24}d.csv", mime="text/csv")
+
 st.subheader("Nuvem de palavras")
 
 col_escopo, col_n = st.columns([2, 1])
@@ -447,5 +458,11 @@ if freqs:
     with st.container(border=True):
         st.image(nuvem.to_array(), width="stretch")
         st.caption(f"Figura — nuvem de palavras de r/{SUB} ({escopo.lower()}).")
+
+    png_buf = io.BytesIO()
+    nuvem.to_image().save(png_buf, format="PNG")
+    st.download_button(
+        "Baixar nuvem (PNG)", png_buf.getvalue(),
+        file_name=f"{SUB}_nuvem_{escopo.lower().replace(' ', '_')}.png", mime="image/png")
 else:
     st.caption("Sem dado suficiente ainda para montar a nuvem.")
