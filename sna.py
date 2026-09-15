@@ -35,15 +35,32 @@ MAX_THREAD = 40                      # threads maiores viram cliques que dominam
 
 MENTION_RE = re.compile(r"(?<![\w/])/?u/([A-Za-z0-9_-]{3,20})", re.IGNORECASE)
 STOPWORDS = {
-    "que", "não", "nao", "com", "uma", "um", "para", "mais", "como", "por",
-    "isso", "essa", "esse", "muito", "também", "tambem", "você", "voce",
-    "ele", "ela", "eles", "elas", "mas", "ser", "estar", "tem", "tinha",
-    "foi", "são", "sao", "aqui", "ali", "pra", "pro", "tudo", "nada", "onde",
-    "quando", "porque", "assim", "sobre", "entre", "the", "and", "for",
-    "that", "this", "with", "have", "has", "are", "was", "but", "not",
-    "you", "your", "from", "just", "like", "what", "when", "how", "why",
-    "would", "could", "should", "will", "about", "there", "their", "them",
-    "then", "than", "been",
+    # funcionais/preenchimento em PT-BR — deixa sobrar palavra de conteudo
+    "que", "não", "nao", "com", "uma", "um", "uns", "umas", "para", "mais",
+    "como", "por", "isso", "isto", "essa", "esse", "essas", "esses", "esta",
+    "estas", "este", "estes", "muito", "muita", "muitos", "muitas", "também",
+    "tambem", "você", "voce", "vocês", "voces", "ele", "ela", "eles", "elas",
+    "mas", "ser", "estar", "sendo", "estando", "tem", "tém", "têm", "tinha",
+    "tinham", "tenho", "tenha", "foi", "fui", "for", "fosse", "são", "sao",
+    "aqui", "ali", "lá", "la", "pra", "pro", "tudo", "nada", "algo", "alguma",
+    "algum", "alguns", "algumas", "onde", "quando", "porque", "porquê",
+    "assim", "sobre", "entre", "sem", "num", "numa", "nem", "seu", "sua",
+    "seus", "suas", "meu", "minha", "meus", "minhas", "teu", "tua", "nosso",
+    "nossa", "dele", "dela", "deles", "delas", "qual", "quais", "quem",
+    "cada", "outro", "outra", "outros", "outras", "todo", "toda", "todos",
+    "todas", "qualquer", "quaisquer", "menos", "apenas", "bastante",
+    "sempre", "ainda", "já", "ja", "so", "só", "vai", "vou", "vamos", "vem",
+    "veio", "faz", "fazer", "fazendo", "pode", "pude", "podem", "podia",
+    "poder", "quer", "quero", "querem", "queria", "acho", "acha", "acham",
+    "sei", "sabe", "tipo", "cara", "gente", "né", "ne", "tá", "ta", "tô",
+    "to", "coisa", "coisas", "forma", "exemplo", "então", "entao", "aí",
+    "ai", "depois", "antes", "agora", "hoje", "vez", "vezes", "lado",
+    "parte", "mesmo", "mesma", "mesmos", "mesmas", "certo", "certa",
+    "verdade", "pois", "logo", "talvez", "aliás", "alias", "the", "and",
+    "for", "that", "this", "with", "have", "has",
+    "are", "was", "but", "not", "you", "your", "from", "just", "like",
+    "what", "when", "how", "why", "would", "could", "should", "will",
+    "about", "there", "their", "them", "then", "than", "been",
 }
 
 
