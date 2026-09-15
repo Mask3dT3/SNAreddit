@@ -59,6 +59,11 @@ def cold_data(sub, win, proj):
 
 
 @st.cache_data(ttl=300)
+def term_freqs_data(sub, win):
+    return db.term_frequencies(sub, win, limit=200)
+
+
+@st.cache_data(ttl=300)
 def role_data(sub, win):
     now = time.time()
     return (pd.DataFrame(db.participation_stats(sub, win, now)),
@@ -143,7 +148,7 @@ if not vol.empty:
                            name="comentários", line=dict(width=1.5)))
     f.update_layout(height=220, margin=dict(t=20, b=20, l=0, r=0), showlegend=False,
                     yaxis=dict(title="comentários / 5 min", rangemode="tozero"))
-    st.plotly_chart(f, use_container_width=True)
+    st.plotly_chart(f, width="stretch")
 
     if not head.empty:
         with st.expander("Feed recente"):
@@ -157,6 +162,13 @@ gs, actors = cold_data(SUB, WIN, PROJ)
 
 if gs.empty:
     st.info("Nenhum snapshot ainda — o job de análise ainda não rodou.")
+    st.stop()
+if actors.empty:
+    # graph_snapshots e actor_snapshots sao gravados em duas escritas
+    # separadas (sna.snapshot); se a segunda falhar/atrasar, gs existe mas
+    # actors nao, e todo o resto da pagina depende das colunas de actors.
+    st.info("Snapshot do grafo existe mas os atores ainda não foram gravados "
+            "— tente recarregar em alguns minutos.")
     st.stop()
 
 cur = gs.iloc[-1]
@@ -188,7 +200,9 @@ m = st.columns(5)
 m[0].metric("Participantes", int(cur["n_nodes"]), delta=int(cur["n_nodes"] - prev["n_nodes"]))
 m[1].metric("k-core máximo", int(cur["max_core"]), delta=int(cur["max_core"] - prev["max_core"]),
             help="Núcleo duro. Queda sustentada = sub esvaziando.")
-if cur["reciprocity"] is None:
+if pd.isna(cur["reciprocity"]):
+    # null vira NaN depois do round-trip Postgres->pandas, nao None —
+    # "is None" nunca era verdadeiro aqui e mostrava "nan" na projecao copart.
     m[2].metric("Reciprocidade", "n/a",
                 help="Não se aplica: co-participação é não-dirigida por construção.")
 else:
@@ -208,7 +222,7 @@ if len(gs) > 3:
     st.plotly_chart(
         go.Figure(go.Scatter(x=gs["ts_dt"], y=gs[met], mode="lines+markers"))
           .update_layout(height=220, margin=dict(t=10, b=10, l=0, r=0)),
-        use_container_width=True)
+        width="stretch")
 
 st.subheader("Atores")
 frouxo = cur["clustering"] < 0.10
@@ -227,7 +241,7 @@ with ta:
         actors.nlargest(20, "w_in_degree")[
             ["author", "w_in_degree", "in_degree", "out_degree", "pagerank",
              "coreness", "community"]],
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
         column_config={"w_in_degree": "respostas recebidas",
                        "in_degree": "pessoas distintas",
                        "out_degree": "respostas dadas"})
@@ -239,7 +253,7 @@ with tb:
         d = actors.nlargest(20, "out_degree")[
             ["author", "out_degree", "w_in_degree", "coreness", "community"]].copy()
         d["saldo"] = d["out_degree"] - d["w_in_degree"]
-        st.dataframe(d, use_container_width=True, hide_index=True,
+        st.dataframe(d, width="stretch", hide_index=True,
                      column_config={"out_degree": "respostas dadas",
                                     "w_in_degree": "recebidas",
                                     "saldo": "saldo (dá − recebe)"})
@@ -254,7 +268,7 @@ with tc:
     st.dataframe(
         actors.nlargest(20, "betweenness")[
             ["author", "betweenness", "community", "in_degree", "out_degree"]],
-        use_container_width=True, hide_index=True)
+        width="stretch", hide_index=True)
 
 with td:
     st.caption("Maior variação de betweenness em 48h. Precisa de pelo menos dois "
@@ -264,7 +278,7 @@ with td:
         st.info("Ainda sem histórico suficiente. Vai popular sozinho conforme o "
                 "workflow de análise acumula execuções.")
     else:
-        st.dataframe(r, use_container_width=True, hide_index=True)
+        st.dataframe(r, width="stretch", hide_index=True)
 
 st.subheader("Reply graph" if PROJ == "reply" else "Grafo de co-participação")
 res = graph_layout(SUB, WIN, PROJ)
@@ -291,7 +305,7 @@ if res:
                     line=dict(width=0.5, color="white"))))
     fig.update_layout(height=430, showlegend=False, margin=dict(t=5, b=5, l=0, r=0),
                       xaxis=dict(visible=False), yaxis=dict(visible=False))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 st.divider()
 st.subheader("Tribos e lideranças")
@@ -416,7 +430,7 @@ with col_n:
     n_palavras = st.slider("Número de palavras", 20, 150, 80, step=10)
 
 if escopo == "Todo o subreddit":
-    freqs = {r["term"]: r["n"] for r in db.term_frequencies(SUB, WIN, limit=200)}
+    freqs = {r["term"]: r["n"] for r in term_freqs_data(SUB, WIN)}
     st.caption(f"Termos acumulados dia a dia desde que este recurso entrou no ar, "
                f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
 else:
