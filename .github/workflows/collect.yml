@@ -4,6 +4,16 @@ on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+    inputs:
+      backfill_days:
+        description: >-
+          Rode um backfill histórico de N dias em vez do poll normal —
+          busca comentários/posts direto do Arctic Shift, corpo incluído,
+          sem passar pelo limite de 7 dias do nosso próprio banco. Use 90
+          para semear de vez as janelas de 30/60/90 dias. Deixe em branco
+          nas execuções agendadas.
+        required: false
+        default: ""
 
 concurrency:
   group: collect
@@ -12,7 +22,7 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: ${{ github.event.inputs.backfill_days && 60 || 10 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +30,13 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -r requirements-jobs.txt
-      - run: python collector.py poll --lookback 180
+      - run: |
+          if [ -n "$BACKFILL_DAYS" ]; then
+            python collector.py backfill --days "$BACKFILL_DAYS"
+          else
+            python collector.py poll --lookback 180
+          fi
         env:
           DATABASE_URL:     ${{ secrets.DATABASE_URL }}
           TARGET_SUBREDDIT: ${{ vars.TARGET_SUBREDDIT }}
+          BACKFILL_DAYS:    ${{ github.event.inputs.backfill_days }}
