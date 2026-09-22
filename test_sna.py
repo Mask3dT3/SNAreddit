@@ -137,6 +137,30 @@ class BucketTermsByDayTest(unittest.TestCase):
         self.assertEqual(sna.bucket_terms_by_day(rows), {})
 
 
+class TopicBridgesTest(unittest.TestCase):
+    def test_flair_em_varias_tribos_fica_no_topo(self):
+        flair_rows = [
+            {"author": "alice", "flair": "Dúvida de Inglês"},
+            {"author": "bob", "flair": "Dúvida de Inglês"},
+            {"author": "eve", "flair": "Dúvida de Inglês"},
+            {"author": "alice", "flair": "Discussão"},
+        ]
+        comm_of = {"alice": 0, "bob": 1, "eve": -1}
+        out = sna.topic_bridges(flair_rows, comm_of)
+        self.assertEqual(out[0]["flair"], "Dúvida de Inglês")
+        self.assertEqual(out[0]["tribos"], 2)   # eve e -1 (isolada), nao conta
+        self.assertEqual(out[0]["autores"], 3)
+
+    def test_ignora_flair_vazio(self):
+        flair_rows = [{"author": "alice", "flair": None}]
+        self.assertEqual(sna.topic_bridges(flair_rows, {"alice": 0}), [])
+
+    def test_autor_sem_comunidade_conhecida_nao_quebra(self):
+        flair_rows = [{"author": "fantasma", "flair": "Discussão"}]
+        out = sna.topic_bridges(flair_rows, {})
+        self.assertEqual(out, [{"flair": "Discussão", "tribos": 0, "autores": 1}])
+
+
 class TribeTopicsTest(unittest.TestCase):
     def test_flair_predominante_por_comunidade(self):
         flair_rows = [

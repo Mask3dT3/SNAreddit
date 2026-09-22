@@ -443,6 +443,34 @@ st.download_button(
     "Baixar tabela (CSV)", tabela.to_csv(index=False).encode("utf-8"),
     file_name=f"{SUB}_tribos_liderancas_{WIN // 24}d.csv", mime="text/csv")
 
+st.subheader("Tópicos recorrentes")
+st.caption(
+    "Este subreddit não usa hashtag — flair (rótulo que o autor escolhe ao "
+    "postar) é o equivalente real aqui. Volume mede o que aparece mais; a "
+    "tabela ao lado mede o que atravessa mais tribos, que não é sempre a "
+    "mesma coisa: um flair pode ser popular só dentro de uma tribo.")
+
+flair_volume = Counter(r["flair"] for r in flair_rows if r.get("flair"))
+if flair_volume:
+    col_vol, col_pontes = st.columns(2)
+    with col_vol:
+        st.caption("Volume por tópico (comentários na janela)")
+        vol_df = pd.DataFrame(flair_volume.most_common(), columns=["flair", "comentários"])
+        st.plotly_chart(
+            go.Figure(go.Bar(x=vol_df["comentários"], y=vol_df["flair"], orientation="h"))
+              .update_layout(height=max(220, 28 * len(vol_df)),
+                             margin=dict(t=10, b=10, l=0, r=0),
+                             yaxis=dict(autorange="reversed")),
+            width="stretch")
+    with col_pontes:
+        st.caption("Tópicos que unem mais tribos")
+        pontes = pd.DataFrame(sna.topic_bridges(flair_rows, comm_of))
+        st.dataframe(pontes, hide_index=True, width="stretch",
+                     column_config={"flair": "tema", "tribos": "tribos distintas",
+                                    "autores": "autores"})
+else:
+    st.caption("Este subreddit não usa flair nos posts — sem eixo de tópico pra medir.")
+
 st.subheader("Nuvem de palavras")
 
 col_eixo, col_n = st.columns([2, 1])
@@ -495,6 +523,11 @@ if freqs:
         st.image(nuvem.to_array(), width="stretch")
         st.caption(f"Figura — nuvem de palavras de r/{SUB} ({rotulo}).")
 
+    st.caption("Top 20 palavras-chave (mesma contagem da nuvem, em ranking)")
+    top_termos = pd.DataFrame(
+        sorted(freqs.items(), key=lambda x: -x[1])[:20], columns=["termo", "ocorrências"])
+    st.dataframe(top_termos, hide_index=True, width="stretch")
+
     png_buf = io.BytesIO()
     nuvem.to_image().save(png_buf, format="PNG")
     st.download_button(
@@ -502,3 +535,26 @@ if freqs:
         file_name=f"{SUB}_nuvem_{rotulo.replace(' ', '_')}.png", mime="image/png")
 else:
     st.caption("Sem dado suficiente ainda para montar a nuvem.")
+
+st.divider()
+with st.expander("Para discussão: encaixe de marca"):
+    st.caption(
+        "Não é um veredito automático — são os sinais que este dashboard já mede, "
+        "organizados pra guiar a conversa do grupo sobre a pergunta do exercício "
+        "('vocês veem possibilidade de alguma marca participar dessa conversa?').")
+    linhas = []
+    if flair_volume:
+        top_flair, top_n = flair_volume.most_common(1)[0]
+        linhas.append(f"- Tema mais recorrente: **{top_flair}** "
+                       f"({top_n} comentários na janela de {WIN // 24} dias).")
+    if not pd.isna(cur["reciprocity"]):
+        tom = ("conversa com troca mútua" if cur["reciprocity"] > 0.3
+               else "pergunta-e-resposta, pouca troca de volta")
+        linhas.append(f"- Reciprocidade {cur['reciprocity']:.2f} → formato predominante: {tom}.")
+    linhas.append(
+        f"- Assortatividade {cur['assortativity']:.2f} → "
+        f"{'heavy users tendem a falar entre si' if cur['assortativity'] > 0.1 else 'sem sinal forte de bolha de poder concentrada'}.")
+    linhas.append(
+        f"- Gini de atividade {cur['gini_activity']:.2f} → "
+        f"{'poucas contas concentram a atividade' if cur['gini_activity'] > 0.7 else 'atividade distribuída entre muitos autores, não só uns poucos influenciadores'}.")
+    st.markdown("\n".join(linhas))

@@ -358,6 +358,29 @@ def top_terms(bodies, top_n=5, min_len=4):
     return word_frequencies(bodies, min_len).most_common(top_n)
 
 
+def topic_bridges(flair_rows, comm_of):
+    """
+    Caminho inverso de tribe_topics: para cada flair, em quantas tribos
+    (comunidades do Louvain) distintas ha autor que comenta nele. Um flair
+    que aparece em muitas tribos e o que de fato atravessa/une o subreddit;
+    um flair preso a uma unica tribo e so o rotulo dela.
+    """
+    tribos_por_flair = defaultdict(set)
+    autores_por_flair = defaultdict(set)
+    for r in flair_rows:
+        flair = r.get("flair")
+        if not flair:
+            continue
+        autores_por_flair[flair].add(r["author"])
+        c = comm_of.get(r["author"])
+        if c is not None and c != -1:
+            tribos_por_flair[flair].add(c)
+    return sorted(
+        ({"flair": f, "tribos": len(tribos_por_flair.get(f, ())),
+          "autores": len(autores_por_flair[f])} for f in autores_por_flair),
+        key=lambda x: (-x["tribos"], -x["autores"]))
+
+
 def tribe_topics(flair_rows, comm_of):
     """
     Rotulo de tribo pelo flair predominante entre os posts que a comunidade

@@ -26,8 +26,11 @@ create table if not exists submissions (
     fetched_utc   double precision
 );
 
+-- projection: 'reply' ou 'copart' (sna.PROJECTIONS) — cada snapshot roda para
+-- as duas, entao ambas fazem parte da chave primaria.
 create table if not exists graph_snapshots (
     ts             double precision not null,
+    projection     text not null,
     window_hours   integer not null,
     subreddit      text not null,
     n_nodes        integer,
@@ -40,11 +43,16 @@ create table if not exists graph_snapshots (
     modularity     double precision,
     gini_activity  double precision,
     new_authors    integer,
-    primary key (ts, window_hours, subreddit)
+    n_components   integer,
+    giant_frac     double precision,
+    clustering     double precision,
+    leaf_frac      double precision,
+    primary key (ts, projection, window_hours, subreddit)
 );
 
 create table if not exists actor_snapshots (
     ts            double precision not null,
+    projection    text not null,
     window_hours  integer not null,
     subreddit     text not null,
     author        text not null,
@@ -55,7 +63,7 @@ create table if not exists actor_snapshots (
     betweenness   double precision,
     coreness      integer,
     community     integer,
-    primary key (ts, window_hours, subreddit, author)
+    primary key (ts, projection, window_hours, subreddit, author)
 );
 
 -- Mencoes 'u/fulano' extraidas do body assim que o comentario chega (job de
