@@ -77,6 +77,11 @@ def flairs_data(sub):
 
 
 @st.cache_data(ttl=300)
+def text_signal_rows(sub, lookback_hours=24 * 7):
+    return db.recent_comments_with_body(sub, lookback_hours)
+
+
+@st.cache_data(ttl=300)
 def role_data(sub, win):
     now = time.time()
     return (pd.DataFrame(db.participation_stats(sub, win, now)),
@@ -535,6 +540,102 @@ if freqs:
         file_name=f"{SUB}_nuvem_{rotulo.replace(' ', '_')}.png", mime="image/png")
 else:
     st.caption("Sem dado suficiente ainda para montar a nuvem.")
+
+st.divider()
+st.header("Análise textual")
+st.caption(
+    "Esta seção classifica cada comentário individualmente (autor, texto, "
+    "palavras principais, tópico, tribo, sentimento) e usa essa classificação "
+    "para responder se os tópicos se alinham com as tribos estruturais e "
+    "quais termos parecem específicos de um grupo ou contexto. Usa o texto "
+    "vivo dos comentários — sobrevive só 7 dias na política de retenção do "
+    "banco — então cobre a última semana, não a janela de "
+    f"{WIN // 24} dias escolhida na barra lateral. Sentimento é por léxico "
+    "PT-BR (contagem de palavra positiva/negativa): é um sinal aproximado, "
+    "não entende negação, ironia ou sarcasmo — trate como indício agregado "
+    "por tópico, não como classificação individual confiável de um "
+    "comentário específico.")
+
+rows_7d = text_signal_rows(SUB)
+if not rows_7d:
+    st.caption("Sem comentários com corpo ainda vivo para classificar.")
+else:
+    classificado = sna.classify_comments(rows_7d, comm_of, topics)
+    df_class = pd.DataFrame(classificado)
+
+    st.subheader("Classificação de conversas")
+    st.dataframe(
+        df_class[["autor", "texto", "palavras_principais", "topico", "tribo", "sentimento"]]
+            .sort_values("autor"),
+        hide_index=True, width="stretch", height=350,
+        column_config={
+            "autor": "autor",
+            "texto": st.column_config.TextColumn("texto", width="large"),
+            "palavras_principais": "palavras principais",
+            "topico": "tópico", "tribo": "tribo", "sentimento": "sentimento"})
+    st.download_button(
+        "Baixar classificação completa (CSV)", df_class.to_csv(index=False).encode("utf-8"),
+        file_name=f"{SUB}_classificacao_conversas_7d.csv", mime="text/csv")
+
+    st.subheader("Sentimento por tópico")
+    st.caption("Algum tópico concentra comentários predominantemente positivos ou negativos?")
+    sent_topico = pd.DataFrame(sna.sentiment_by_topic(classificado))
+    if not sent_topico.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Positivo", y=sent_topico["topico"], x=sent_topico["positivo"],
+                             orientation="h", marker_color="#2a9d8f"))
+        fig.add_trace(go.Bar(name="Neutro", y=sent_topico["topico"], x=sent_topico["neutro"],
+                             orientation="h", marker_color="#8d99ae"))
+        fig.add_trace(go.Bar(name="Negativo", y=sent_topico["topico"], x=sent_topico["negativo"],
+                             orientation="h", marker_color="#e76f51"))
+        fig.update_layout(barmode="stack", height=max(220, 30 * len(sent_topico)),
+                          margin=dict(t=30, b=10, l=0, r=0),
+                          legend=dict(orientation="h", y=1.15),
+                          yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Tópicos por tribo")
+    st.caption("Os tópicos confirmam as tribos já identificadas acima, ou revelam grupos novos?")
+    cross = sna.topic_tribe_crosstab(classificado)
+    if cross:
+        cross_df = pd.DataFrame(cross).fillna(0).astype(int).T
+        st.dataframe(cross_df, width="stretch")
+
+    st.subheader("Quem introduz vocabulário na comunidade")
+    st.caption(
+        "Para os termos mais usados nesta janela: quem apareceu primeiro e "
+        "quantos autores distintos usaram o mesmo termo depois. É ordem "
+        "temporal observada, não prova de influência causal — o primeiro "
+        "uso pode ser coincidência, não 'contágio' de vocabulário.")
+    adoption = pd.DataFrame(sna.term_adoption(rows_7d))
+    if not adoption.empty:
+        adoption["primeiro_uso"] = pd.to_datetime(adoption["primeiro_uso"], unit="s")
+        st.dataframe(
+            adoption, hide_index=True, width="stretch",
+            column_config={
+                "termo": "termo", "autor_pioneiro": "autor pioneiro",
+                "primeiro_uso": st.column_config.DatetimeColumn(
+                    "primeiro uso", format="DD/MM HH:mm"),
+                "autores_depois": "autores que adotaram depois",
+                "usos_totais": "usos totais"})
+    else:
+        st.caption("Nenhum termo com adoção subsequente clara nesta janela de 7 dias.")
+
+    st.subheader("Termos possivelmente específicos de um tópico")
+    st.caption(
+        "Termos cuja maioria das ocorrências se concentra num único tópico — "
+        "candidatos a expressão ou jargão cujo significado depende do "
+        "contexto daquela tribo. São candidatos para leitura humana, não uma "
+        "lista fechada de gírias.")
+    ctx_terms = pd.DataFrame(sna.context_specific_terms(rows_7d))
+    if not ctx_terms.empty:
+        ctx_terms["concentracao"] = (ctx_terms["concentracao"] * 100).round(0).astype(int).astype(str) + "%"
+        st.dataframe(
+            ctx_terms, hide_index=True, width="stretch",
+            column_config={"termo": "termo", "topico_principal": "tópico principal",
+                           "concentracao": "concentração", "ocorrencias": "ocorrências"})
+    else:
+        st.caption("Nenhum termo atingiu o mínimo de ocorrências para essa análise ainda.")
 
 st.divider()
 with st.expander("Para discussão: encaixe de marca"):

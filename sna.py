@@ -358,6 +358,169 @@ def top_terms(bodies, top_n=5, min_len=4):
     return word_frequencies(bodies, min_len).most_common(top_n)
 
 
+# --------------------------------------------------------- analise textual
+# Sentimento por lexico PT-BR: contagem de palavra positiva/negativa, sem
+# NLP nem LLM. E aproximado de proposito — nao capta negacao ("nao gostei"
+# conta como positivo), ironia ou sarcasmo. Serve como sinal agregado (media
+# por topico), nao como classificacao individual confiavel de um comentario.
+POSITIVE_WORDS = {
+    "otimo", "ótimo", "otima", "ótima", "bom", "boa", "excelente", "adorei",
+    "adoro", "gosto", "gostei", "maravilha", "maravilhoso", "maravilhosa",
+    "incrivel", "incrível", "perfeito", "perfeita", "sucesso", "feliz",
+    "felicidade", "alegria", "obrigado", "obrigada", "parabens", "parabéns",
+    "sensacional", "fantastico", "fantástico", "fantastica", "fantástica",
+    "recomendo", "ajudou", "ajuda", "util", "útil", "facil", "fácil",
+    "simples", "gratidao", "gratidão", "satisfeito", "satisfeita",
+    "tranquilo", "tranquila", "legal", "bacana", "lindo", "linda", "bonito",
+    "bonita", "agradeco", "agradeço", "valeu", "confianca", "confiança",
+    "evoluindo", "evolucao", "evolução", "progresso", "motivado", "motivada",
+    "animado", "animada", "orgulho", "orgulhoso", "orgulhosa", "aprendi",
+    "aprendendo", "fluente", "fluencia", "fluência", "consegui",
+}
+NEGATIVE_WORDS = {
+    "ruim", "pessimo", "péssimo", "pessima", "péssima", "horrivel",
+    "horrível", "terrivel", "terrível", "odeio", "odiei", "detesto",
+    "chato", "chata", "dificil", "difícil", "dificuldade", "complicado",
+    "complicada", "confuso", "confusa", "triste", "tristeza", "raiva",
+    "odio", "ódio", "decepcao", "decepção", "decepcionado", "decepcionada",
+    "frustracao", "frustração", "frustrado", "frustrada", "cansado",
+    "cansada", "cansativo", "cansativa", "desisto", "desistir",
+    "impossivel", "impossível", "errado", "errada", "erro", "problema",
+    "problemas", "pena", "lamentavel", "lamentável", "decepcionante",
+    "desanimado", "desanimada", "insuportavel", "insuportável", "chateado",
+    "chateada", "irritante", "irritado", "irritada", "medo", "ansiedade",
+    "ansioso", "ansiosa", "preocupado", "preocupada", "sofrimento",
+    "fracasso", "falha", "pior", "piora", "travado", "travada", "travei",
+    "esqueco", "esqueço", "esqueci",
+}
+
+
+def comment_sentiment(body, min_len=3):
+    """Score = positivas - negativas no corpo tokenizado; rotulo pelo sinal.
+    Ver aviso de metodo no comentario acima de POSITIVE_WORDS."""
+    words = _tokenize(body, min_len)
+    pos = sum(1 for w in words if w in POSITIVE_WORDS)
+    neg = sum(1 for w in words if w in NEGATIVE_WORDS)
+    score = pos - neg
+    label = "Positivo" if score > 0 else "Negativo" if score < 0 else "Neutro"
+    return score, label
+
+
+def classify_comments(rows, comm_of, tribo_labels, top_keywords=3):
+    """
+    Monta a tabela do exercicio (autor, texto, palavras principais, topico,
+    tribo, sentimento) a partir de rows no formato de
+    db.recent_comments_with_body (id, author, body, created_utc, flair).
+    tribo_labels e o dict {community_id: nome} de sna.tribe_topics, para usar
+    o MESMO rotulo de tribo ja exibido no resto do dashboard.
+    """
+    out = []
+    for r in rows:
+        words = _tokenize(r.get("body"), min_len=4)
+        principais = ", ".join(w for w, _ in Counter(words).most_common(top_keywords))
+        score, label = comment_sentiment(r.get("body"))
+        c = comm_of.get(r["author"])
+        tribo = ("Sem tribo definida" if c is None or c == -1
+                 else tribo_labels.get(c, f"Comunidade {c}"))
+        out.append({
+            "id": r["id"], "autor": r["author"], "texto": r.get("body") or "",
+            "palavras_principais": principais,
+            "topico": r.get("flair") or SEM_FLAIR, "tribo": tribo,
+            "sentimento": label, "sentimento_score": score,
+            "created_utc": r["created_utc"],
+        })
+    return out
+
+
+def sentiment_by_topic(classified):
+    """Distribuicao Positivo/Negativo/Neutro por topico — responde se algum
+    topico concentra comentarios predominantemente positivos ou negativos."""
+    by_topic = defaultdict(Counter)
+    for c in classified:
+        by_topic[c["topico"]][c["sentimento"]] += 1
+    out = []
+    for topico, counts in by_topic.items():
+        total = sum(counts.values())
+        out.append({
+            "topico": topico, "comentarios": total,
+            "positivo": counts.get("Positivo", 0),
+            "negativo": counts.get("Negativo", 0),
+            "neutro": counts.get("Neutro", 0),
+        })
+    return sorted(out, key=lambda x: -x["comentarios"])
+
+
+def topic_tribe_crosstab(classified):
+    """{tribo: Counter({topico: n})} — quantos comentarios de cada tribo
+    caem em cada topico. Tribo (estrutura de interacao) e topico (flair
+    escolhido) sao eixos independentes; a tabela mostra se coincidem ou
+    revelam grupo que a particao estrutural nao capturou."""
+    cross = defaultdict(Counter)
+    for c in classified:
+        cross[c["tribo"]][c["topico"]] += 1
+    return cross
+
+
+def term_adoption(rows, top_n=15, min_len=4, min_adopters=2):
+    """
+    Para os termos mais frequentes: quem usou primeiro (por created_utc) e
+    quantos autores distintos usaram o mesmo termo depois. E um FATO
+    observavel (ordem temporal), nao prova de influencia causal — o primeiro
+    uso pode ser coincidencia, nao "contagio" de vocabulario. Filtra termos
+    com poucos usos (min_adopters) pra nao listar acaso isolado.
+    """
+    rows = [r for r in rows if r.get("body") and r.get("created_utc") is not None]
+    tokenizado = [(r, set(_tokenize(r["body"], min_len))) for r in rows]
+    freq = word_frequencies([r["body"] for r, _ in tokenizado], min_len)
+    candidatos = [w for w, _ in freq.most_common(top_n * 3) if w not in STOPWORDS]
+
+    out = []
+    for termo in candidatos:
+        usos = sorted((r for r, toks in tokenizado if termo in toks),
+                      key=lambda r: r["created_utc"])
+        if len(usos) < min_adopters:
+            continue
+        primeiro = usos[0]
+        seguidores = {r["author"] for r in usos[1:] if r["author"] != primeiro["author"]}
+        if not seguidores:
+            continue
+        out.append({
+            "termo": termo, "autor_pioneiro": primeiro["author"],
+            "primeiro_uso": primeiro["created_utc"],
+            "autores_depois": len(seguidores), "usos_totais": len(usos),
+        })
+    return sorted(out, key=lambda x: -x["autores_depois"])[:top_n]
+
+
+def context_specific_terms(rows, top_n=15, min_len=4, min_occurrences=5):
+    """
+    Concentracao de cada termo por topico (flair): se quase todas as
+    ocorrencias caem num unico flair, o termo provavelmente so faz sentido
+    naquele contexto — candidato a giria/jargao dependente de tribo, nao
+    vocabulario geral do subreddit. Sao candidatos pra leitura humana, nao
+    uma lista fechada de girias.
+    """
+    rows = [r for r in rows if r.get("body")]
+    por_termo = defaultdict(Counter)
+    for r in rows:
+        topico = r.get("flair") or SEM_FLAIR
+        for w in set(_tokenize(r["body"], min_len)):
+            if w not in STOPWORDS:
+                por_termo[w][topico] += 1
+
+    out = []
+    for termo, by_topico in por_termo.items():
+        total = sum(by_topico.values())
+        if total < min_occurrences:
+            continue
+        topico_principal, n_principal = by_topico.most_common(1)[0]
+        out.append({
+            "termo": termo, "topico_principal": topico_principal,
+            "concentracao": n_principal / total, "ocorrencias": total,
+        })
+    return sorted(out, key=lambda x: (-x["concentracao"], -x["ocorrencias"]))[:top_n]
+
+
 def topic_bridges(flair_rows, comm_of):
     """
     Caminho inverso de tribe_topics: para cada flair, em quantas tribos

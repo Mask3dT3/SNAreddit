@@ -137,6 +137,93 @@ class BucketTermsByDayTest(unittest.TestCase):
         self.assertEqual(sna.bucket_terms_by_day(rows), {})
 
 
+class CommentSentimentTest(unittest.TestCase):
+    def test_positivo(self):
+        self.assertEqual(sna.comment_sentiment("adorei o curso, ótimo demais")[1], "Positivo")
+
+    def test_negativo(self):
+        self.assertEqual(sna.comment_sentiment("péssimo, muito difícil e frustrante")[1], "Negativo")
+
+    def test_neutro_sem_palavra_de_lexico(self):
+        score, label = sna.comment_sentiment("o professor falou sobre verbos irregulares")
+        self.assertEqual((score, label), (0, "Neutro"))
+
+    def test_empate_e_neutro(self):
+        score, label = sna.comment_sentiment("bom mas ruim ao mesmo tempo")
+        self.assertEqual((score, label), (0, "Neutro"))
+
+    def test_corpo_vazio(self):
+        self.assertEqual(sna.comment_sentiment(None), (0, "Neutro"))
+
+
+class ClassifyCommentsTest(unittest.TestCase):
+    def test_monta_linha_com_tribo_rotulada(self):
+        rows = [{"id": "c1", "author": "alice", "body": "adorei, muito bom mesmo",
+                 "created_utc": 100.0, "flair": "Dúvida de Inglês"}]
+        out = sna.classify_comments(rows, {"alice": 0}, {0: "Estudo e Aprendizado"})
+        self.assertEqual(out[0]["tribo"], "Estudo e Aprendizado")
+        self.assertEqual(out[0]["topico"], "Dúvida de Inglês")
+        self.assertEqual(out[0]["sentimento"], "Positivo")
+
+    def test_autor_sem_tribo_conhecida(self):
+        rows = [{"id": "c1", "author": "fantasma", "body": "oi", "created_utc": 1.0, "flair": None}]
+        out = sna.classify_comments(rows, {}, {})
+        self.assertEqual(out[0]["tribo"], "Sem tribo definida")
+        self.assertEqual(out[0]["topico"], sna.SEM_FLAIR)
+
+
+class SentimentByTopicTest(unittest.TestCase):
+    def test_agrega_contagens_por_topico(self):
+        classificado = [
+            {"topico": "A", "sentimento": "Positivo"},
+            {"topico": "A", "sentimento": "Positivo"},
+            {"topico": "A", "sentimento": "Negativo"},
+            {"topico": "B", "sentimento": "Neutro"},
+        ]
+        out = {r["topico"]: r for r in sna.sentiment_by_topic(classificado)}
+        self.assertEqual(out["A"]["positivo"], 2)
+        self.assertEqual(out["A"]["negativo"], 1)
+        self.assertEqual(out["A"]["comentarios"], 3)
+        self.assertEqual(out["B"]["neutro"], 1)
+
+
+class TermAdoptionTest(unittest.TestCase):
+    def test_identifica_pioneiro_e_seguidores(self):
+        rows = [
+            {"author": "alice", "body": "gramatica alema e dificil", "created_utc": 1.0},
+            {"author": "bob", "body": "concordo, gramatica alema trava todo mundo", "created_utc": 2.0},
+            {"author": "eve", "body": "gramatica alema mesmo, ninguem escapa", "created_utc": 3.0},
+        ]
+        out = {r["termo"]: r for r in sna.term_adoption(rows, min_adopters=2)}
+        self.assertIn("gramatica", out)
+        self.assertEqual(out["gramatica"]["autor_pioneiro"], "alice")
+        self.assertEqual(out["gramatica"]["autores_depois"], 2)
+
+    def test_termo_usado_por_um_so_autor_fica_de_fora(self):
+        rows = [
+            {"author": "alice", "body": "xilofone azul", "created_utc": 1.0},
+            {"author": "alice", "body": "xilofone azul de novo", "created_utc": 2.0},
+        ]
+        out = sna.term_adoption(rows, min_adopters=2)
+        self.assertEqual(out, [])
+
+
+class ContextSpecificTermsTest(unittest.TestCase):
+    def test_termo_concentrado_num_topico_aparece(self):
+        rows = ([{"author": f"u{i}", "body": "subjuntivo complica", "flair": "Dúvida de Espanhol"}
+                 for i in range(5)]
+                + [{"author": "u9", "body": "subjuntivo aqui tambem", "flair": "Discussão"}])
+        out = {r["termo"]: r for r in sna.context_specific_terms(rows, min_occurrences=5)}
+        self.assertIn("subjuntivo", out)
+        self.assertEqual(out["subjuntivo"]["topico_principal"], "Dúvida de Espanhol")
+        self.assertAlmostEqual(out["subjuntivo"]["concentracao"], 5 / 6)
+
+    def test_abaixo_do_minimo_de_ocorrencias_fica_de_fora(self):
+        rows = [{"author": "u1", "body": "girino raro por aqui", "flair": "Discussão"}]
+        out = sna.context_specific_terms(rows, min_occurrences=5)
+        self.assertEqual(out, [])
+
+
 class TopicBridgesTest(unittest.TestCase):
     def test_flair_em_varias_tribos_fica_no_topo(self):
         flair_rows = [
