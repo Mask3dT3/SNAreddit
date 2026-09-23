@@ -5,6 +5,7 @@ exceto o layout de visualizacao, que fica em cache por 5 minutos.
 Deploy: Streamlit Community Cloud, apontando para este repo.
 Em Settings > Secrets, cole:  DATABASE_URL = "postgresql://..."
 """
+import html
 import io
 import json
 import time
@@ -170,13 +171,20 @@ _NODE_COLORS = {"Usuário": "#2a9d8f", "Post/Conteúdo": "#e76f51"}
 def _vis_network_html(nos, arestas, height=460):
     """Grafo interativo (arrastar, zoom) via vis-network — o equivalente
     visual do que Kumu/Gephi mostrariam a partir das mesmas duas tabelas,
-    sem depender de conta externa (Kumu) ou app desktop (Gephi)."""
+    sem depender de conta externa (Kumu) ou app desktop (Gephi).
+
+    O nome do no (autor ou titulo de post real, texto livre e adversario por
+    natureza) so entra em `label`, desenhado num <canvas> — imune a HTML.
+    `title` (o tooltip on-hover) o vis-network insere via innerHTML, entao
+    precisa ser escapado — sem isso um titulo de post tipo
+    "<img src=x onerror=...>" executaria dentro do tooltip.
+    """
     nodes = [{"id": n["nome"], "label": n["nome"],
               "color": _NODE_COLORS.get(n["categoria"], "#8d99ae"),
               "shape": "dot" if n["categoria"] == "Usuário" else "square",
-              "title": f"{n['nome']} ({n['categoria']})"} for n in nos]
+              "title": f"{html.escape(n['nome'])} ({html.escape(n['categoria'])})"} for n in nos]
     edges = [{"from": a["fonte"], "to": a["destino"], "width": a["peso"],
-              "arrows": "to", "title": f"{a['tipo_interacao']} (peso {a['peso']})"}
+              "arrows": "to", "title": f"{html.escape(a['tipo_interacao'])} (peso {a['peso']})"}
              for a in arestas]
     nodes_json = json.dumps(nodes, ensure_ascii=False).replace("</", "<\\/")
     edges_json = json.dumps(edges, ensure_ascii=False).replace("</", "<\\/")
