@@ -6,6 +6,7 @@ Deploy: Streamlit Community Cloud, apontando para este repo.
 Em Settings > Secrets, cole:  DATABASE_URL = "postgresql://..."
 """
 import io
+import json
 import time
 import math
 from collections import Counter
@@ -15,6 +16,7 @@ import pandas as pd
 import networkx as nx
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 from wordcloud import WordCloud
 
 import collector
@@ -151,6 +153,49 @@ def text_signal_rows(sub, start, end):
     recuperados = [{**r, "body": corpos[r["id"]]} for r in faltando
                    if r["id"] in corpos and r["id"] not in ja_vistos]
     return live + recuperados, completo and len(faltando) < MISSING_BODY_LIMIT
+
+
+@st.cache_data(ttl=1800)
+def exercise_sample(sub, start, end, n=15):
+    """Amostra de interações reais pro exercício de nós/arestas com peso
+    fixo por tipo — ver sna.exercise_nodes_edges."""
+    comment_rows = db.sample_interactions(sub, start, end)
+    mention_rows = db.raw_mentions(sub, start, end)
+    return sna.exercise_nodes_edges(comment_rows, mention_rows, n=n)
+
+
+_NODE_COLORS = {"Usuário": "#2a9d8f", "Post/Conteúdo": "#e76f51"}
+
+
+def _vis_network_html(nos, arestas, height=460):
+    """Grafo interativo (arrastar, zoom) via vis-network — o equivalente
+    visual do que Kumu/Gephi mostrariam a partir das mesmas duas tabelas,
+    sem depender de conta externa (Kumu) ou app desktop (Gephi)."""
+    nodes = [{"id": n["nome"], "label": n["nome"],
+              "color": _NODE_COLORS.get(n["categoria"], "#8d99ae"),
+              "shape": "dot" if n["categoria"] == "Usuário" else "square",
+              "title": f"{n['nome']} ({n['categoria']})"} for n in nos]
+    edges = [{"from": a["fonte"], "to": a["destino"], "width": a["peso"],
+              "arrows": "to", "title": f"{a['tipo_interacao']} (peso {a['peso']})"}
+             for a in arestas]
+    nodes_json = json.dumps(nodes, ensure_ascii=False).replace("</", "<\\/")
+    edges_json = json.dumps(edges, ensure_ascii=False).replace("</", "<\\/")
+    return f"""
+    <div id="rede" style="height:{height}px;border:1px solid #ddd;border-radius:8px;"></div>
+    <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"
+            integrity="sha384-yxKDWWf0wwdUj/gPeuL11czrnKFQROnLgY8ll7En9NYoXibgg3C6NK/UDHNtUgWJ"
+            crossorigin="anonymous"></script>
+    <script>
+      var nodes = new vis.DataSet({nodes_json});
+      var edges = new vis.DataSet({edges_json});
+      var container = document.getElementById("rede");
+      var network = new vis.Network(container, {{nodes: nodes, edges: edges}}, {{
+        physics: {{stabilization: true}},
+        interaction: {{hover: true, dragNodes: true, zoomView: true}},
+        edges: {{smooth: {{type: "continuous"}}, color: "rgba(120,120,120,0.5)"}}
+      }});
+    </script>
+    """
 
 
 @st.cache_data(ttl=300)
@@ -763,6 +808,63 @@ else:
                            "concentracao": "concentração", "ocorrencias": "ocorrências"})
     else:
         st.caption("Nenhum termo atingiu o mínimo de ocorrências para essa análise ainda.")
+
+st.divider()
+st.header("Exercício: nós e arestas (grafo)")
+st.caption(
+    "Amostra de interações reais desta janela/período no formato exato do "
+    "exercício de grafos: tabela de vértices (nós) e tabela de arestas "
+    "(conexões), com peso FIXO por tipo de interação — diferente do peso "
+    "por contagem que o resto do dashboard usa. Comentário em post = 2 "
+    "(conexão média), Menção/Resposta direta = 3 (conexão forte). Sem "
+    "aresta de 'curtida': o Reddit não expõe quem curtiu o quê (upvote é "
+    "anônimo), só resposta, comentário em post e menção viram aresta real "
+    "aqui.")
+
+n_amostra = st.slider("Número de interações na amostra", 10, 20, 15)
+tabela_nos, tabela_arestas = exercise_sample(SUB, TEXT_START, TEXT_END, n=n_amostra)
+
+if not tabela_arestas:
+    st.caption("Sem interações estruturadas suficientes nesta janela/período para montar a amostra.")
+else:
+    col_nos, col_arestas = st.columns(2)
+    with col_nos:
+        st.caption("Tabela de vértices (nós)")
+        df_nos = pd.DataFrame(tabela_nos)
+        st.dataframe(df_nos, hide_index=True, width="stretch",
+                    column_config={"id": "ID", "nome": "Nome/Perfil", "categoria": "Categoria"})
+        st.download_button(
+            "Baixar nós (CSV)", _csv_safe(df_nos).to_csv(index=False).encode("utf-8"),
+            file_name=f"{SUB}_nos.csv", mime="text/csv")
+    with col_arestas:
+        st.caption("Tabela de arestas (conexões)")
+        df_arestas = pd.DataFrame(tabela_arestas)
+        st.dataframe(df_arestas, hide_index=True, width="stretch",
+                    column_config={"fonte": "Fonte", "destino": "Destino",
+                                   "tipo_interacao": "Tipo de Interação", "peso": "Peso"})
+        st.download_button(
+            "Baixar arestas (CSV)", _csv_safe(df_arestas).to_csv(index=False).encode("utf-8"),
+            file_name=f"{SUB}_arestas.csv", mime="text/csv")
+
+    st.caption(
+        "Grafo interativo (arraste os nós, dê zoom) — o equivalente visual do "
+        "que você montaria no Kumu ou no Gephi importando as duas tabelas "
+        "acima; os CSVs continuam disponíveis pra quem preferir abrir num "
+        "desses. Bolinha = usuário, quadrado = post/conteúdo; espessura da "
+        "linha = peso da interação.")
+    components.html(_vis_network_html(tabela_nos, tabela_arestas), height=480, scrolling=False)
+
+    with st.expander("Para discussão: leitura do grafo"):
+        st.caption(
+            "Perguntas do exercício pra guiar a interpretação — não são "
+            "respondidas automaticamente:")
+        st.markdown(
+            "- Quem são os nós mais conectados (maior grau) nesta amostra?\n"
+            "- Dá pra identificar líderes (alta centralidade) já nesta amostra pequena?\n"
+            "- As tribos/cores batem com o que a seção 'Tribos e lideranças' "
+            "acima aponta pro subreddit inteiro?\n"
+            "- As conexões fortes (peso 3, resposta/menção) e médias (peso 2, "
+            "comentário em post) fazem sentido pra como a comunidade se organiza?")
 
 st.divider()
 with st.expander("Para discussão: encaixe de marca"):

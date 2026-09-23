@@ -520,6 +520,71 @@ def context_specific_terms(rows, top_n=15, min_len=4, min_occurrences=5):
     return sorted(out, key=lambda x: (-x["concentracao"], -x["ocorrencias"]))[:top_n]
 
 
+# ------------------------------------------------ exercicio: nos e arestas
+# Peso FIXO por tipo de interacao (exercicio de grafos da aula), diferente do
+# peso por contagem que build_reply_graph/build_copart_graph usam pro grafo
+# de producao. Sem aresta de "curtida": o Reddit nao expoe quem curtiu o que
+# (upvote e anonimo), so reply/comentario e mencao viram aresta real.
+INTERACTION_WEIGHTS = {"Comentário": 2, "Resposta": 3, "Menção": 3}
+
+
+def exercise_nodes_edges(comment_rows, mention_rows, n=15):
+    """
+    Amostra de interacoes reais no formato exato do exercicio de grafos:
+    ate `n` interacoes mais recentes (resposta a comentario, comentario em
+    post, mencao), com peso fixo por tipo em vez de peso por contagem.
+    Devolve (tabela_nos, tabela_arestas) prontas pra exportar/plotar —
+    mesmas colunas do enunciado (id/nome/categoria e fonte/destino/tipo de
+    interacao/peso).
+
+    comment_rows: dicts com id, author, parent_id, submission_id,
+    submission_title, created_utc (db.sample_interactions).
+    mention_rows: dicts com source_author, target_author, created_utc
+    (db.raw_mentions).
+    """
+    by_id = {r["id"]: r for r in comment_rows if r.get("author")}
+
+    interacoes = []
+    for r in comment_rows:
+        autor, parent = r.get("author"), r.get("parent_id") or ""
+        if not autor or not parent:
+            continue
+        if parent.startswith("t1_"):
+            pai = by_id.get(parent[3:])
+            if pai and pai.get("author") and pai["author"] != autor:
+                interacoes.append({
+                    "fonte": autor, "destino": pai["author"], "tipo": "Resposta",
+                    "destino_categoria": "Usuário", "created_utc": r["created_utc"]})
+        elif parent.startswith("t3_"):
+            post = r.get("submission_title") or f"Post {r.get('submission_id', '?')}"
+            interacoes.append({
+                "fonte": autor, "destino": post, "tipo": "Comentário",
+                "destino_categoria": "Post/Conteúdo", "created_utc": r["created_utc"]})
+
+    for m in mention_rows:
+        if m.get("source_author") and m.get("target_author"):
+            interacoes.append({
+                "fonte": m["source_author"], "destino": m["target_author"], "tipo": "Menção",
+                "destino_categoria": "Usuário", "created_utc": m["created_utc"]})
+
+    interacoes.sort(key=lambda x: -x["created_utc"])
+    interacoes = interacoes[:n]
+
+    categoria_por_nome = {}
+    for it in interacoes:
+        categoria_por_nome[it["fonte"]] = "Usuário"
+        categoria_por_nome.setdefault(it["destino"], it["destino_categoria"])
+    ids = {nome: i for i, nome in enumerate(categoria_por_nome, start=1)}
+
+    tabela_nos = [{"id": ids[nome], "nome": nome, "categoria": cat}
+                  for nome, cat in categoria_por_nome.items()]
+    tabela_arestas = [
+        {"fonte": it["fonte"], "destino": it["destino"], "tipo_interacao": it["tipo"],
+         "peso": INTERACTION_WEIGHTS[it["tipo"]]}
+        for it in interacoes]
+    return tabela_nos, tabela_arestas
+
+
 def topic_bridges(flair_rows, comm_of):
     """
     Caminho inverso de tribe_topics: para cada flair, em quantas tribos

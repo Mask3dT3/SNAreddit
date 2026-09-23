@@ -162,6 +162,23 @@ def comments_missing_body(sub, start, end, limit=8000):
         (sub.lower(), start, end, limit))
 
 
+def sample_interactions(sub, start, end, limit=200):
+    """
+    Comentarios recentes com parent_id e submission_id (estrutura, nao
+    depende do body) pra montar a amostra de nos/arestas do exercicio de
+    grafos com peso fixo por tipo (sna.exercise_nodes_edges). Junta o titulo
+    do post porque ele nunca e apagado, ao contrario do body.
+    """
+    return query(
+        """select c.id, c.author, c.parent_id, c.submission_id, c.created_utc,
+                  s.title as submission_title
+           from comments c left join submissions s on s.id = c.submission_id
+           where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
+             and c.author is not null
+           order by c.created_utc desc limit %s""",
+        (sub.lower(), start, end, limit))
+
+
 def upsert_mentions(rows):
     return _bulk(
         """insert into mentions
@@ -185,6 +202,18 @@ def mentions_received(sub, window_hours, now=None, end=None):
              and target_author not in %s
            group by target_author""",
         (sub.lower(), now - window_hours * 3600, end, _BOTS_LOWER))
+
+
+def raw_mentions(sub, start, end, limit=50):
+    """Mencoes individuais (nao agregadas) num intervalo, pra amostra de
+    arestas do exercicio de grafos (sna.exercise_nodes_edges). A tabela
+    mentions sobrevive 120 dias, igual a linha do comentario."""
+    return query(
+        """select source_author, target_author, created_utc from mentions
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+             and target_author not in %s
+           order by created_utc desc limit %s""",
+        (sub.lower(), start, end, _BOTS_LOWER, limit))
 
 
 def unseen_comment_ids(ids):

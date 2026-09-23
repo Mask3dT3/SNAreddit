@@ -325,5 +325,65 @@ class TribeTopicsTest(unittest.TestCase):
         self.assertEqual(sna.tribe_topics(flair_rows, comm_of), {})
 
 
+class ExerciseNodesEdgesTest(unittest.TestCase):
+    def test_resposta_usa_autor_do_pai_com_peso_3(self):
+        comment_rows = [
+            {"id": "c1", "author": "alice", "parent_id": None,
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": 1},
+            {"id": "c2", "author": "bob", "parent_id": "t1_c1",
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": 2},
+        ]
+        nos, arestas = sna.exercise_nodes_edges(comment_rows, [])
+        self.assertEqual(arestas, [
+            {"fonte": "bob", "destino": "alice", "tipo_interacao": "Resposta", "peso": 3}])
+        self.assertEqual({n["nome"] for n in nos}, {"bob", "alice"})
+
+    def test_comentario_em_post_usa_titulo_com_peso_2(self):
+        comment_rows = [
+            {"id": "c1", "author": "alice", "parent_id": "t3_p1",
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": 1},
+        ]
+        nos, arestas = sna.exercise_nodes_edges(comment_rows, [])
+        self.assertEqual(arestas, [
+            {"fonte": "alice", "destino": "Post A", "tipo_interacao": "Comentário", "peso": 2}])
+        categorias = {n["nome"]: n["categoria"] for n in nos}
+        self.assertEqual(categorias, {"alice": "Usuário", "Post A": "Post/Conteúdo"})
+
+    def test_mencao_vira_aresta_peso_3(self):
+        mention_rows = [{"source_author": "alice", "target_author": "bob", "created_utc": 1}]
+        nos, arestas = sna.exercise_nodes_edges([], mention_rows)
+        self.assertEqual(arestas, [
+            {"fonte": "alice", "destino": "bob", "tipo_interacao": "Menção", "peso": 3}])
+
+    def test_autoresposta_e_ignorada(self):
+        comment_rows = [
+            {"id": "c1", "author": "alice", "parent_id": None,
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": 1},
+            {"id": "c2", "author": "alice", "parent_id": "t1_c1",
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": 2},
+        ]
+        _, arestas = sna.exercise_nodes_edges(comment_rows, [])
+        self.assertEqual(arestas, [])
+
+    def test_respeita_limite_n_priorizando_mais_recentes(self):
+        comment_rows = [
+            {"id": f"c{i}", "author": f"autor{i}", "parent_id": "t3_p1",
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": i}
+            for i in range(5)]
+        _, arestas = sna.exercise_nodes_edges(comment_rows, [], n=2)
+        self.assertEqual(len(arestas), 2)
+        self.assertEqual({a["fonte"] for a in arestas}, {"autor4", "autor3"})
+
+    def test_no_nao_duplica_quando_nome_repete(self):
+        comment_rows = [
+            {"id": "c1", "author": "alice", "parent_id": "t3_p1",
+             "submission_id": "p1", "submission_title": "Post A", "created_utc": 1},
+            {"id": "c2", "author": "alice", "parent_id": "t3_p2",
+             "submission_id": "p2", "submission_title": "Post B", "created_utc": 2},
+        ]
+        nos, _ = sna.exercise_nodes_edges(comment_rows, [])
+        self.assertEqual(sum(1 for n in nos if n["nome"] == "alice"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
