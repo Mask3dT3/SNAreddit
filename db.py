@@ -142,6 +142,26 @@ def recent_comments_with_body(sub, lookback_hours, now=None, start=None, end=Non
         (sub.lower(), lo, hi))
 
 
+def comments_missing_body(sub, start, end, limit=8000):
+    """
+    Comentarios num intervalo cujo corpo ja foi apagado pela retencao de 7
+    dias, mas cuja linha ainda existe (sobrevive 120 dias). Usada pela
+    analise textual do dashboard para saber quais ids pedir de volta ao
+    Arctic Shift (arquivo historico, sem a retencao do nosso banco) quando
+    o periodo pedido (fixo ou janela movel) e mais antigo que 7 dias.
+    8000 cobre a lacuna de 90 dias de um sub de ~70 comentarios/dia; se o
+    resultado vier com exatamente `limit` linhas, o chamador sabe que
+    truncou (guarda as mais antigas da lacuna, `order by created_utc`).
+    """
+    return query(
+        """select c.id, c.author, c.created_utc, s.flair as flair
+           from comments c left join submissions s on s.id = c.submission_id
+           where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
+             and c.body is null and c.author is not null
+           order by c.created_utc limit %s""",
+        (sub.lower(), start, end, limit))
+
+
 def upsert_mentions(rows):
     return _bulk(
         """insert into mentions
@@ -291,23 +311,6 @@ def submission_stats(sub, window_hours, now=None, end=None):
            where subreddit=%s and created_utc>=%s and created_utc<=%s
              and author is not null and author not in %s
            group by author""",
-        (sub.lower(), now - window_hours * 3600, end, _BOTS))
-
-
-def mentionable_comments(sub, window_hours, now=None, end=None):
-    """
-    Corpo do comentario para mencao (u/fulano) e termos frequentes. So retorna
-    linhas com body != null — a retencao (schema.sql) zera o body com 7 dias,
-    entao em janelas maiores isto cobre so a fatia recente por construcao.
-    Ver end= em submission_titles.
-    """
-    now = now or time.time()
-    end = end if end is not None else now + 86400
-    return query(
-        """select author, body from comments
-           where subreddit=%s and created_utc>=%s and created_utc<=%s
-             and body is not null and author is not null
-             and author not in %s""",
         (sub.lower(), now - window_hours * 3600, end, _BOTS))
 
 

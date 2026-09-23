@@ -49,11 +49,19 @@ Ordem importa — pular ou inverter um passo perde dado permanentemente.
 
 - **Retenção**: corpo do comentário sobrevive só 7 dias; a linha (sem corpo) sobrevive
   120 dias; snapshots de grafo 365 dias; snapshots de ator 7 dias. Seções que dependem
-  de texto vivo (nuvem "por tribo", classificação de conversas em "Análise textual")
-  só cobrem os últimos 7 dias — inclusive quando o dashboard está no modo de **período
-  fixo** e esse período já passou dos 7 dias: as métricas estruturais (grafo, tópicos
-  por flair, tribos) continuam funcionando normalmente, mas as seções de texto vivo
-  mostram "sem dado", não erro.
+  de texto (nuvem "por tribo", classificação de conversas em "Análise textual") cobrem
+  a janela/período inteiro pedido, inclusive no modo de **período fixo**: o corpo que já
+  saiu do banco pela retenção de 7 dias é recuperado na hora no arquivo histórico da
+  Arctic Shift (`collector.fetch_comment_bodies`, cache de 30 min no dashboard). Só não
+  há o que recuperar além de 120 dias — aí a própria linha do comentário já foi apagada,
+  e essas seções mostram "sem dado", não erro. Esse recálculo sob demanda depende da
+  Arctic Shift estar no ar; se ela falhar, a seção degrada pra "sem dado" em vez de
+  quebrar o dashboard. Também tem teto de volume (`MISSING_BODY_LIMIT` = 8000
+  comentários, `MAX_BACKFILL_PAGES` = 80 páginas no collector): cobre a lacuna de 90
+  dias de um sub do porte de r/idiomas (~70 comentários/dia); se algum dia o volume
+  passar disso, a busca prioriza os comentários mais antigos da lacuna e o dashboard
+  avisa explicitamente ("volume alto demais para recuperar tudo") em vez de mostrar um
+  recorte incompleto sem dizer nada.
 - **Cadência real dos cron**: o agendamento do GitHub Actions é otimista — sob carga da
   plataforma as execuções atrasam ou pulam. Um canário no fim do `analyze` falha (e
   dispara e-mail nativo do GitHub) se o comentário mais recente no banco tiver mais de

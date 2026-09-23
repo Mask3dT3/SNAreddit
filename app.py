@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from wordcloud import WordCloud
 
+import collector
 import db
 import sna
 
@@ -114,9 +115,42 @@ def flairs_data(sub):
     return db.subreddit_flairs(sub)
 
 
-@st.cache_data(ttl=300)
-def text_signal_rows(sub, lookback_hours=24 * 7, start=None, end=None):
-    return db.recent_comments_with_body(sub, lookback_hours, start=start, end=end)
+STRUCT_RETENTION_S = 120 * 86400   # linha do comentario (sem body) sobrevive 120 dias
+LIVE_BODY_RETENTION_S = 7 * 86400  # body em si so sobrevive 7 dias
+MISSING_BODY_LIMIT = 8000          # teto de comentarios recuperaveis por chamada
+CACHE_BUCKET_S = 300               # granularidade do "agora" usado na chave de cache
+
+
+@st.cache_data(ttl=1800, show_spinner="Recuperando texto histórico da Arctic Shift...")
+def text_signal_rows(sub, start, end):
+    """
+    Cobre a janela/periodo inteiro pedido, nao so os ultimos 7 dias: o texto
+    vivo no banco (body) cobre a parte recente; para a parte mais antiga que
+    a retencao de 7 dias, busca o corpo que falta direto no arquivo da
+    Arctic Shift (mesma fonte do collector.py) e completa com o resto dos
+    metadados que a linha do comentario ainda guarda ate 120 dias. Alem
+    de 120 dias o comentario ja saiu do banco de vez — nao ha o que recuperar.
+
+    Devolve (rows, completo). completo=False quando o volume da lacuna
+    passou do teto de recuperacao — nesse caso faltam os comentarios mais
+    recentes da lacuna (a busca prioriza os mais antigos primeiro).
+    """
+    now = time.time()
+    start = max(start, now - STRUCT_RETENTION_S)
+    cutoff = min(end, now - LIVE_BODY_RETENTION_S)
+    live = db.recent_comments_with_body(
+        sub, 0, start=max(start, now - LIVE_BODY_RETENTION_S), end=end)
+    if start >= now - LIVE_BODY_RETENTION_S:
+        return live, True
+
+    faltando = db.comments_missing_body(sub, start, cutoff, limit=MISSING_BODY_LIMIT)
+    if not faltando:
+        return live, True
+    corpos, completo = collector.fetch_comment_bodies(sub, start, cutoff, [r["id"] for r in faltando])
+    ja_vistos = {r["id"] for r in live}
+    recuperados = [{**r, "body": corpos[r["id"]]} for r in faltando
+                   if r["id"] in corpos and r["id"] not in ja_vistos]
+    return live + recuperados, completo and len(faltando) < MISSING_BODY_LIMIT
 
 
 @st.cache_data(ttl=300)
@@ -125,7 +159,6 @@ def role_data(sub, win, now=None, end=None):
     return (pd.DataFrame(db.participation_stats(sub, win, now, end=end)),
             pd.DataFrame(db.submission_stats(sub, win, now, end=end)),
             pd.DataFrame(db.mentions_received(sub, win, now, end=end)),
-            db.mentionable_comments(sub, win, now, end=end),
             db.topic_signal(sub, win, now, end=end))
 
 
@@ -171,6 +204,7 @@ else:
         format_func=lambda h: {720: "30 dias", 1440: "60 dias", 2160: "90 dias"}[h])
     PERIOD_START = PERIOD_END = None
     NOW_TS, END_BOUND, FIXO = time.time(), None, False
+
 PROJ = st.sidebar.radio(
     "Projeção do grafo", ["reply", "copart"],
     format_func=lambda p: {"reply": "Reply graph (quem responde quem)",
@@ -254,6 +288,14 @@ if actors.empty:
     st.info("Snapshot do grafo existe mas os atores ainda não foram gravados "
             "— tente recarregar em alguns minutos.")
     st.stop()
+
+# "agora" arredondado pro balde de CACHE_BUCKET_S: se usasse time.time() cru,
+# a chave do cache de text_signal_rows mudaria a cada rerun do Streamlit (ex:
+# mexer no slider de palavras da nuvem, la embaixo) e o cache nunca acertaria
+# na janela movel, refazendo a busca cara na Arctic Shift toda hora.
+TEXT_END = PERIOD_END if FIXO else round(time.time() / CACHE_BUCKET_S) * CACHE_BUCKET_S
+TEXT_START = PERIOD_START if FIXO else TEXT_END - WIN * 3600
+rows_texto, texto_completo = text_signal_rows(SUB, TEXT_START, TEXT_END)
 
 cur = gs.iloc[-1]
 prev = gs.iloc[-2] if len(gs) > 1 else cur
@@ -411,7 +453,7 @@ st.caption(
     "Papel de engajamento vem do k-core e do grau. Liderança combina respostas "
     "recebidas, menções e engajamento gerado nos posts próprios.")
 
-part, subs_df, mentions_df, text_rows, flair_rows = role_data(
+part, subs_df, mentions_df, flair_rows = role_data(
     SUB, WIN, now=NOW_TS if FIXO else None, end=END_BOUND)
 
 at = actors.copy()
@@ -468,11 +510,11 @@ for _, grp in com_tribo.groupby("community"):
 com_tribo = at[at["community"] != -1]
 
 st.caption("Menções recebidas são extraídas e guardadas assim que o comentário "
-           "chega, então cobrem a janela inteira. Termos mais citados (no "
-           "expansor abaixo) continuam limitados aos últimos 7 dias — o corpo "
-           "do comentário é apagado depois disso pela política de retenção do "
-           "banco, e guardar toda palavra de todo comentário pesaria mais do "
-           "que o texto que essa retenção existe pra economizar.")
+           "chega, então cobrem a janela inteira. A nuvem 'por tribo' abaixo "
+           "também cobre a janela/período inteiro agora — o corpo apagado pela "
+           "retenção de 7 dias é buscado de volta no arquivo da Arctic Shift "
+           "quando necessário; só não recupera comentário com mais de 120 "
+           "dias, cuja linha já saiu do banco.")
 if flair_rows and not any(topics.values()):
     st.caption("Este subreddit não usa flair nos posts, então o nome da tribo "
                "cai no número da comunidade.")
@@ -555,9 +597,8 @@ col_eixo, col_n = st.columns([2, 1])
 with col_eixo:
     eixo = st.selectbox("Nuvem de", ["Todo o subreddit", "Por flair", "Por tribo (estrutural)"],
                         help="Flair é um rótulo estável do post (ex: 'Dúvida de Inglês'), "
-                             "cobre a janela toda. Tribo é a comunidade do Louvain — muda "
-                             "de id a cada execução do cron, então só dá pra usar com o "
-                             "texto ao vivo (7 dias).")
+                             "cobre a janela toda. Tribo é a comunidade do Louvain desta "
+                             "mesma janela/período — também cobre a janela toda.")
 with col_n:
     n_palavras = st.slider("Número de palavras", 20, 150, 80, step=10)
 
@@ -566,12 +607,13 @@ freqs, rotulo = {}, "todo o subreddit"
 if eixo == "Por tribo (estrutural)":
     tribo_escolhida = st.selectbox("Tribo", sorted({t["tribo"] for t in tribos_info}))
     comm_ids = at.loc[at["tribo"] == tribo_escolhida, "community"].unique()
-    bodies = [r["body"] for r in text_rows if comm_of.get(r["author"]) in comm_ids]
+    bodies = [r["body"] for r in rows_texto if comm_of.get(r["author"]) in comm_ids]
     freqs = dict(sna.top_terms(bodies, top_n=200))
     rotulo = f"tribo {tribo_escolhida}"
-    st.caption("Tribo (Louvain) muda de id a cada execução do cron, então esta opção usa "
-               "só o texto ao vivo — sobrevive 7 dias na retenção do banco, não é a "
-               "janela de 30/60/90 dias selecionada.")
+    st.caption("Cobre a mesma janela/período das demais análises — com a exceção de "
+               "comentários com mais de 120 dias, cuja linha já saiu do banco."
+               + ("" if texto_completo else " Volume alto demais para recuperar tudo "
+                  "desta vez — faltam os comentários mais recentes da lacuna."))
 
 elif eixo == "Por flair":
     flairs = flairs_data(SUB)
@@ -624,24 +666,28 @@ st.caption(
     "Esta seção classifica cada comentário individualmente (autor, texto, "
     "palavras principais, tópico, tribo, sentimento) e usa essa classificação "
     "para responder se os tópicos se alinham com as tribos estruturais e "
-    "quais termos parecem específicos de um grupo ou contexto. Usa o texto "
-    "vivo dos comentários — sobrevive só 7 dias na política de retenção do "
-    "banco — então cobre só essa fatia recente, "
-    + (f"o que quase certamente NÃO inclui o período fixo {PERIODO_NOME}: "
-       "se as tabelas abaixo vierem vazias, é isso — o corpo do comentário "
-       "já foi apagado, não um erro." if FIXO else
-       f"não a janela de {WIN // 24} dias escolhida na barra lateral.")
-    + " Sentimento é por léxico PT-BR (contagem de palavra positiva/negativa): "
-    "é um sinal aproximado, não entende negação, ironia ou sarcasmo — trate "
-    "como indício agregado por tópico, não como classificação individual "
-    "confiável de um comentário específico.")
+    "quais termos parecem específicos de um grupo ou contexto. O corpo do "
+    "comentário sobrevive só 7 dias no banco; para a parte mais antiga da "
+    "janela/período, o texto que faltar é buscado na hora no arquivo "
+    "histórico da Arctic Shift — então cobre "
+    + (f"o período fixo {PERIODO_NOME} inteiro" if FIXO
+       else f"a janela de {WIN // 24} dias escolhida na barra lateral")
+    + ", com a exceção de comentários com mais de 120 dias: aí a própria "
+      "linha já saiu do banco e não há mais o que recuperar. Sentimento é "
+      "por léxico PT-BR (contagem de palavra positiva/negativa): é um sinal "
+      "aproximado, não entende negação, ironia ou sarcasmo — trate como "
+      "indício agregado por tópico, não como classificação individual "
+      "confiável de um comentário específico.")
+if not texto_completo:
+    st.caption("⚠️ O volume de comentários fora da retenção viva passou do teto de "
+               "recuperação desta vez — as tabelas abaixo cobrem só a parte mais antiga "
+               "da lacuna; os comentários mais recentes dela (mas ainda fora dos últimos "
+               "7 dias) podem estar faltando.")
 
-rows_7d = (text_signal_rows(SUB, start=PERIOD_START, end=PERIOD_END) if FIXO
-           else text_signal_rows(SUB))
-if not rows_7d:
-    st.caption("Sem comentários com corpo ainda vivo para classificar.")
+if not rows_texto:
+    st.caption("Sem comentários com corpo recuperável para classificar.")
 else:
-    classificado = sna.classify_comments(rows_7d, comm_of, topics)
+    classificado = sna.classify_comments(rows_texto, comm_of, topics)
     df_class = pd.DataFrame(classificado)
 
     st.subheader("Classificação de conversas")
@@ -656,7 +702,7 @@ else:
             "topico": "tópico", "tribo": "tribo", "sentimento": "sentimento"})
     st.download_button(
         "Baixar classificação completa (CSV)", _csv_safe(df_class).to_csv(index=False).encode("utf-8"),
-        file_name=f"{SUB}_classificacao_conversas_7d.csv", mime="text/csv")
+        file_name=f"{SUB}_classificacao_conversas.csv", mime="text/csv")
 
     st.subheader("Sentimento por tópico")
     st.caption("Algum tópico concentra comentários predominantemente positivos ou negativos?")
@@ -688,7 +734,7 @@ else:
         "quantos autores distintos usaram o mesmo termo depois. É ordem "
         "temporal observada, não prova de influência causal — o primeiro "
         "uso pode ser coincidência, não 'contágio' de vocabulário.")
-    adoption = pd.DataFrame(sna.term_adoption(rows_7d))
+    adoption = pd.DataFrame(sna.term_adoption(rows_texto))
     if not adoption.empty:
         adoption["primeiro_uso"] = pd.to_datetime(adoption["primeiro_uso"], unit="s")
         st.dataframe(
@@ -700,7 +746,7 @@ else:
                 "autores_depois": "autores que adotaram depois",
                 "usos_totais": "usos totais"})
     else:
-        st.caption("Nenhum termo com adoção subsequente clara nesta janela de 7 dias.")
+        st.caption("Nenhum termo com adoção subsequente clara nesta janela.")
 
     st.subheader("Termos possivelmente específicos de um tópico")
     st.caption(
@@ -708,7 +754,7 @@ else:
         "candidatos a expressão ou jargão cujo significado depende do "
         "contexto daquela tribo. São candidatos para leitura humana, não uma "
         "lista fechada de gírias.")
-    ctx_terms = pd.DataFrame(sna.context_specific_terms(rows_7d))
+    ctx_terms = pd.DataFrame(sna.context_specific_terms(rows_texto))
     if not ctx_terms.empty:
         ctx_terms["concentracao"] = (ctx_terms["concentracao"] * 100).round(0).astype(int).astype(str) + "%"
         st.dataframe(

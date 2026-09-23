@@ -97,6 +97,53 @@ def _drain(kind, sub, start, end, norm, label, verbose=True, sleep=0.35):
     return total
 
 
+MAX_BACKFILL_PAGES = 80  # ~8000 comentarios: cobre a lacuna de 90d de um sub de ~70/dia
+
+
+def fetch_comment_bodies(sub, start, end, ids_wanted, sleep=0.35):
+    """
+    So-leitura: busca no arquivo da Arctic Shift o corpo de comentarios que ja
+    saiu do nosso banco pela retencao de 7 dias (a linha ainda existe ate 120
+    dias, so falta o body). Nao grava nada — usada pela analise textual do
+    dashboard para periodo fixo/janela movel mais antigos que 7 dias.
+
+    Devolve (bodies_por_id, completo). completo=False quando o teto de
+    paginas foi atingido antes de esgotar o intervalo ou achar todos os ids
+    pedidos (ou o servico falhou mesmo com o retry do _fetch) — a varredura e
+    ascendente a partir de start, entao um resultado incompleto tende a faltar
+    os comentarios mais recentes da lacuna (mais perto da retencao viva), nao
+    os mais antigos. Nunca derruba o dashboard: erro vira completo=False.
+    """
+    wanted = set(ids_wanted)
+    found = {}
+    cursor, page = start, 0
+    while cursor < end and wanted - found.keys():
+        if page >= MAX_BACKFILL_PAGES:
+            return found, False
+        try:
+            batch = _fetch("comments", sub, cursor, end)
+        except Exception as e:
+            print(f"    fetch_comment_bodies: desistindo ({type(e).__name__})", file=sys.stderr)
+            return found, False
+        if not batch:
+            break
+        page += 1
+        newest = cursor
+        for c in batch:
+            cid, ts = c.get("id"), c.get("created_utc")
+            if cid in wanted and c.get("body"):
+                found[cid] = c["body"]
+            if ts is not None:
+                newest = max(newest, float(ts))
+        if newest <= cursor:
+            break
+        cursor = newest + 0.001
+        if len(batch) < PAGE:
+            break
+        time.sleep(sleep)
+    return found, True
+
+
 def poll(sub, lookback_minutes=180):
     """
     Reconsulta uma janela fixa recente. Idempotente: rodar duas vezes seguidas
