@@ -121,20 +121,25 @@ _BOTS = ("AutoModerator", "[deleted]", "")
 _BOTS_LOWER = ("automoderator", "[deleted]")   # target_author e guardado minusculo
 
 
-def recent_comments_with_body(sub, lookback_hours, now=None):
+def recent_comments_with_body(sub, lookback_hours, now=None, start=None, end=None):
     """
     Fatia curta e recente, usada so pela extracao de sinais de texto a cada
     run do cron — nao e a janela de analise (WIN), e so a novidade desde o
     ultimo run. Traz o flair do post via join porque daily_terms persiste
     por flair (estavel entre dias), nao por community do Louvain (instavel).
+    start/end, se passados, substituem lookback_hours/now por um intervalo
+    fixo do passado — usado pelo modo de periodo fixo do dashboard. Nao
+    muda o resultado quando body ja foi apagado pela retencao de 7 dias.
     """
     now = now or time.time()
+    lo = start if start is not None else now - lookback_hours * 3600
+    hi = end if end is not None else now + 86400
     return query(
         """select c.id, c.author, c.body, c.created_utc, s.flair as flair
            from comments c left join submissions s on s.id = c.submission_id
-           where c.subreddit=%s and c.created_utc>=%s
+           where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
              and c.body is not null and c.author is not null""",
-        (sub.lower(), now - lookback_hours * 3600))
+        (sub.lower(), lo, hi))
 
 
 def upsert_mentions(rows):
@@ -147,16 +152,19 @@ def upsert_mentions(rows):
         rows)
 
 
-def mentions_received(sub, window_hours, now=None):
+def mentions_received(sub, window_hours, now=None, end=None):
     """Agregado persistido — ao contrario do body, nunca e apagado antes da
-    hora, entao cobre a janela toda (30/60/90d) igual as demais metricas."""
+    hora, entao cobre a janela toda (30/60/90d) igual as demais metricas.
+    Ver end= em submission_titles."""
     now = now or time.time()
+    end = end if end is not None else now + 86400
     return query(
         """select target_author as author, count(*) as mencoes_recebidas
            from mentions
-           where subreddit=%s and created_utc>=%s and target_author not in %s
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+             and target_author not in %s
            group by target_author""",
-        (sub.lower(), now - window_hours * 3600, _BOTS_LOWER))
+        (sub.lower(), now - window_hours * 3600, end, _BOTS_LOWER))
 
 
 def unseen_comment_ids(ids):
@@ -197,45 +205,54 @@ def subreddit_flairs(sub):
         (sub.lower(),))]
 
 
-def submission_titles(sub, window_hours, now=None, flair=None):
+def submission_titles(sub, window_hours, now=None, flair=None, end=None):
     """Titulo dos posts nunca e apagado (so o body do comentario tem
     retencao), entao cobre a janela inteira desde sempre — sem precisar de
-    acumulo dia a dia como daily_terms."""
+    acumulo dia a dia como daily_terms. end=None mantem o comportamento de
+    sempre (sem teto superior, cobre ate agora); passar end permite fatiar
+    um periodo fixo do passado em vez de uma janela movel ate agora."""
     now = now or time.time()
     cutoff = now - window_hours * 3600
+    end = end if end is not None else now + 86400
     if flair is None:
         return query(
             """select title from submissions
-               where subreddit=%s and created_utc>=%s and author not in %s""",
-            (sub.lower(), cutoff, _BOTS))
+               where subreddit=%s and created_utc>=%s and created_utc<=%s
+                 and author not in %s""",
+            (sub.lower(), cutoff, end, _BOTS))
     return query(
         """select title from submissions
-           where subreddit=%s and created_utc>=%s and author not in %s and flair=%s""",
-        (sub.lower(), cutoff, _BOTS, flair))
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+             and author not in %s and flair=%s""",
+        (sub.lower(), cutoff, end, _BOTS, flair))
 
 
-def term_frequencies(sub, window_hours, now=None, limit=200, flair=None):
+def term_frequencies(sub, window_hours, now=None, limit=200, flair=None, end=None):
     """Agregado persistido, cobre a janela toda (30/60/90d) igual as demais
     metricas — ao contrario do texto ao vivo, que so sobrevive 7 dias.
-    flair=None soma todos os flairs (escopo 'todo o subreddit')."""
+    flair=None soma todos os flairs (escopo 'todo o subreddit'). Ver end= em
+    submission_titles."""
     now = now or time.time()
+    end = end if end is not None else now + 86400
     if flair is not None:
         return query(
             """select term, sum(n) as n from daily_terms
-               where subreddit=%s and day>=%s and flair=%s
+               where subreddit=%s and day>=%s and day<=%s and flair=%s
                group by term order by n desc limit %s""",
-            (sub.lower(), now - window_hours * 3600, flair, limit))
+            (sub.lower(), now - window_hours * 3600, end, flair, limit))
     return query(
         """select term, sum(n) as n from daily_terms
-           where subreddit=%s and day>=%s
+           where subreddit=%s and day>=%s and day<=%s
            group by term order by n desc limit %s""",
-        (sub.lower(), now - window_hours * 3600, limit))
+        (sub.lower(), now - window_hours * 3600, end, limit))
 
 
-def participation_stats(sub, window_hours, now=None):
+def participation_stats(sub, window_hours, now=None, end=None):
     """Frequencia (comentarios), reconhecimento (curtidas) e quem inicia thread
-    (parent_id t3_) vs so responde (t1_) — sinais que o grafo nao carrega."""
+    (parent_id t3_) vs so responde (t1_) — sinais que o grafo nao carrega.
+    Ver end= em submission_titles."""
     now = now or time.time()
+    end = end if end is not None else now + 86400
     return query(
         """select author,
                   count(*) as comentarios,
@@ -243,52 +260,58 @@ def participation_stats(sub, window_hours, now=None):
                   sum(case when parent_id like 't3_%%' then 1 else 0 end) as threads_iniciados,
                   sum(case when parent_id like 't1_%%' then 1 else 0 end) as respostas_dadas
            from comments
-           where subreddit=%s and created_utc>=%s and author is not null
-             and author not in %s
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+             and author is not null and author not in %s
            group by author""",
-        (sub.lower(), now - window_hours * 3600, _BOTS))
+        (sub.lower(), now - window_hours * 3600, end, _BOTS))
 
 
-def submission_stats(sub, window_hours, now=None):
-    """Engajamento gerado por quem abre posts: score e comentarios recebidos."""
+def submission_stats(sub, window_hours, now=None, end=None):
+    """Engajamento gerado por quem abre posts: score e comentarios recebidos.
+    Ver end= em submission_titles."""
     now = now or time.time()
+    end = end if end is not None else now + 86400
     return query(
         """select author,
                   count(*) as posts,
                   coalesce(sum(score), 0) as posts_score,
                   coalesce(sum(num_comments), 0) as posts_engajamento
            from submissions
-           where subreddit=%s and created_utc>=%s and author is not null
-             and author not in %s
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+             and author is not null and author not in %s
            group by author""",
-        (sub.lower(), now - window_hours * 3600, _BOTS))
+        (sub.lower(), now - window_hours * 3600, end, _BOTS))
 
 
-def mentionable_comments(sub, window_hours, now=None):
+def mentionable_comments(sub, window_hours, now=None, end=None):
     """
     Corpo do comentario para mencao (u/fulano) e termos frequentes. So retorna
     linhas com body != null — a retencao (schema.sql) zera o body com 7 dias,
     entao em janelas maiores isto cobre so a fatia recente por construcao.
+    Ver end= em submission_titles.
     """
     now = now or time.time()
+    end = end if end is not None else now + 86400
     return query(
         """select author, body from comments
-           where subreddit=%s and created_utc>=%s
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
              and body is not null and author is not null
              and author not in %s""",
-        (sub.lower(), now - window_hours * 3600, _BOTS))
+        (sub.lower(), now - window_hours * 3600, end, _BOTS))
 
 
-def topic_signal(sub, window_hours, now=None):
+def topic_signal(sub, window_hours, now=None, end=None):
     """Flair dos posts que cada autor comentou — e o 'topico/hashtag' real do
-    Reddit, ao contrario da comunidade do Louvain, que e so estrutura."""
+    Reddit, ao contrario da comunidade do Louvain, que e so estrutura.
+    Ver end= em submission_titles."""
     now = now or time.time()
+    end = end if end is not None else now + 86400
     return query(
         """select c.author as author, s.flair as flair
            from comments c join submissions s on s.id = c.submission_id
-           where c.subreddit=%s and c.created_utc>=%s and c.author is not null
-             and c.author not in %s and s.flair is not null""",
-        (sub.lower(), now - window_hours * 3600, _BOTS))
+           where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
+             and c.author is not null and c.author not in %s and s.flair is not null""",
+        (sub.lower(), now - window_hours * 3600, end, _BOTS))
 
 
 def query(sql, params=()):

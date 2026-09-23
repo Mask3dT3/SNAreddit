@@ -558,14 +558,15 @@ def tribe_topics(flair_rows, comm_of):
     return {c: counter.most_common(1)[0][0] for c, counter in by_comm.items()}
 
 
-def count_new_authors(sub, window_hours, now=None):
+def count_new_authors(sub, window_hours, now=None, end=None):
     now = now or time.time()
+    end = end if end is not None else now + 86400
     r = db.query(
         """select count(*) as n from (
              select author, min(created_utc) as first_seen from comments
              where subreddit=%s and author is not null group by author
-           ) t where first_seen >= %s""",
-        (sub.lower(), now - window_hours * 3600))
+           ) t where first_seen >= %s and first_seen <= %s""",
+        (sub.lower(), now - window_hours * 3600, end))
     return r[0]["n"] if r else 0
 
 

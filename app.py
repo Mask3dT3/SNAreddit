@@ -9,6 +9,7 @@ import io
 import time
 import math
 from collections import Counter
+from datetime import datetime, timezone
 
 import pandas as pd
 import networkx as nx
@@ -18,6 +19,19 @@ from wordcloud import WordCloud
 
 import db
 import sna
+
+
+def _csv_safe(df):
+    """Neutraliza injecao de formula em CSV: celula de texto livre (corpo de
+    comentario do Reddit) comecando com =, +, -, @ ou tab abre como formula
+    no Excel/Google Sheets ao abrir o arquivo baixado. Prefixa com aspa
+    simples so as colunas de texto que podem conter isso."""
+    df = df.copy()
+    perigosos = ("=", "+", "-", "@", "\t", "\r")
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].apply(
+            lambda v: "'" + v if isinstance(v, str) and v[:1] in perigosos else v)
+    return df
 
 st.set_page_config(page_title="Subreddit SNA", layout="wide", page_icon="📊")
 
@@ -61,14 +75,38 @@ def cold_data(sub, win, proj):
     return gs, actors
 
 
-@st.cache_data(ttl=300)
-def term_freqs_data(sub, win, flair=None):
-    return db.term_frequencies(sub, win, limit=200, flair=flair)
+@st.cache_data(ttl=300, show_spinner="Calculando métricas do período fixo...")
+def fixed_period_data(sub, proj, start, end):
+    """
+    Substitui cold_data() quando o usuario escolhe um periodo fixo do
+    calendario: nao existe snapshot persistido do cron para um intervalo
+    arbitrario (os snapshots so cobrem janelas moveis medidas ate o momento
+    em que o cron rodou), entao calcula o grafo e as metricas na hora.
+    Devolve gs/actors no MESMO formato de cold_data() para o resto da pagina
+    renderizar sem nenhuma mudanca.
+    """
+    window_hours = (end - start) / 3600
+    G = sna.BUILDERS[proj](sub, window_hours, now=end)
+    gm, actors = sna.compute_metrics(G)
+    if not gm:
+        return pd.DataFrame(), pd.DataFrame()
+    gm["new_authors"] = sna.count_new_authors(sub, window_hours, now=end, end=end)
+    gs = pd.DataFrame([{"ts": end, "projection": proj, "window_hours": window_hours,
+                        "subreddit": sub, **gm}])
+    actors_df = pd.DataFrame([
+        {"ts": end, "projection": proj, "window_hours": window_hours,
+         "subreddit": sub, "author": a, **m} for a, m in actors.items()])
+    return gs, actors_df
 
 
 @st.cache_data(ttl=300)
-def title_freqs_data(sub, win, flair=None):
-    return db.submission_titles(sub, win, flair=flair)
+def term_freqs_data(sub, win, flair=None, now=None, end=None):
+    return db.term_frequencies(sub, win, now=now, limit=200, flair=flair, end=end)
+
+
+@st.cache_data(ttl=300)
+def title_freqs_data(sub, win, flair=None, now=None, end=None):
+    return db.submission_titles(sub, win, now=now, flair=flair, end=end)
 
 
 @st.cache_data(ttl=300)
@@ -77,23 +115,23 @@ def flairs_data(sub):
 
 
 @st.cache_data(ttl=300)
-def text_signal_rows(sub, lookback_hours=24 * 7):
-    return db.recent_comments_with_body(sub, lookback_hours)
+def text_signal_rows(sub, lookback_hours=24 * 7, start=None, end=None):
+    return db.recent_comments_with_body(sub, lookback_hours, start=start, end=end)
 
 
 @st.cache_data(ttl=300)
-def role_data(sub, win):
-    now = time.time()
-    return (pd.DataFrame(db.participation_stats(sub, win, now)),
-            pd.DataFrame(db.submission_stats(sub, win, now)),
-            pd.DataFrame(db.mentions_received(sub, win, now)),
-            db.mentionable_comments(sub, win, now),
-            db.topic_signal(sub, win, now))
+def role_data(sub, win, now=None, end=None):
+    now = now or time.time()
+    return (pd.DataFrame(db.participation_stats(sub, win, now, end=end)),
+            pd.DataFrame(db.submission_stats(sub, win, now, end=end)),
+            pd.DataFrame(db.mentions_received(sub, win, now, end=end)),
+            db.mentionable_comments(sub, win, now, end=end),
+            db.topic_signal(sub, win, now, end=end))
 
 
 @st.cache_data(ttl=300, show_spinner="Montando o grafo...")
-def graph_layout(sub, win, proj, top_n=120):
-    G = sna.BUILDERS[proj](sub, win)
+def graph_layout(sub, win, proj, now=None, top_n=120):
+    G = sna.BUILDERS[proj](sub, win, now=now)
     if G.number_of_nodes() < 3:
         return None
     total = G.number_of_nodes()
@@ -109,10 +147,30 @@ if not subs:
     st.warning("Banco vazio. Rode o backfill primeiro.")
     st.stop()
 
+FIXED_PERIODS = {
+    "01/09 – 14/09/2026": (
+        datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp(),
+        datetime(2026, 9, 14, 23, 59, 59, tzinfo=timezone.utc).timestamp()),
+}
+
 SUB = st.sidebar.selectbox("Subreddit", subs)
-WIN = st.sidebar.select_slider(
-    "Janela", options=[720, 1440, 2160], value=720,
-    format_func=lambda h: {720: "30 dias", 1440: "60 dias", 2160: "90 dias"}[h])
+MODO_PERIODO = st.sidebar.radio("Tipo de período", ["Janela móvel", "Período fixo"],
+                                horizontal=True)
+if MODO_PERIODO == "Período fixo":
+    PERIODO_NOME = st.sidebar.selectbox("Período fixo", list(FIXED_PERIODS))
+    PERIOD_START, PERIOD_END = FIXED_PERIODS[PERIODO_NOME]
+    WIN = round((PERIOD_END - PERIOD_START) / 3600)
+    NOW_TS, END_BOUND, FIXO = PERIOD_END, PERIOD_END, True
+    st.sidebar.caption(
+        "Todas as análises abaixo são recalculadas na hora para esse "
+        "intervalo — não usam o snapshot do cron, que só cobre janelas "
+        "móveis até o momento em que rodou.")
+else:
+    WIN = st.sidebar.select_slider(
+        "Janela", options=[720, 1440, 2160], value=720,
+        format_func=lambda h: {720: "30 dias", 1440: "60 dias", 2160: "90 dias"}[h])
+    PERIOD_START = PERIOD_END = None
+    NOW_TS, END_BOUND, FIXO = time.time(), None, False
 PROJ = st.sidebar.radio(
     "Projeção do grafo", ["reply", "copart"],
     format_func=lambda p: {"reply": "Reply graph (quem responde quem)",
@@ -126,9 +184,15 @@ st.sidebar.caption(f"Banco: {db.db_size_mb()} MB / 500 MB")
 
 st.title(f"r/{SUB}")
 
-vol, head, uniq, novos, now = hot_data(SUB)
-LAG = 1800   # o Arctic Shift ingere com ~10-15 min de atraso; damos 30 de folga
-if not vol.empty:
+if FIXO:
+    st.caption(
+        f"Período fixo selecionado: {PERIODO_NOME} — os indicadores de "
+        "atividade 'ao vivo' (últimas 24h/6h, feed recente) não se aplicam "
+        "a um recorte histórico e ficam ocultos nesse modo.")
+if not FIXO:
+    vol, head, uniq, novos, now = hot_data(SUB)
+    LAG = 1800   # o Arctic Shift ingere com ~10-15 min de atraso; damos 30 de folga
+if not FIXO and not vol.empty:
     vol["ts"] = pd.to_datetime(vol["bucket"], unit="s")
 
     # A hora corrente esta SEMPRE parcialmente vazia por causa do atraso de
@@ -177,7 +241,8 @@ if not vol.empty:
                             f"score {r['score']}  \n{str(r['body'])[:280]}")
 
 st.divider()
-gs, actors = cold_data(SUB, WIN, PROJ)
+gs, actors = (fixed_period_data(SUB, PROJ, PERIOD_START, PERIOD_END) if FIXO
+              else cold_data(SUB, WIN, PROJ))
 
 if gs.empty:
     st.info("Nenhum snapshot ainda — o job de análise ainda não rodou.")
@@ -193,8 +258,11 @@ if actors.empty:
 cur = gs.iloc[-1]
 prev = gs.iloc[-2] if len(gs) > 1 else cur
 
-st.caption(f"Última análise: {pd.to_datetime(cur['ts'], unit='s'):%d/%m/%Y %H:%M} UTC "
-           f"· janela de {WIN // 24} dias · projeção {PROJ}")
+if FIXO:
+    st.caption(f"Período fixo: {PERIODO_NOME} · projeção {PROJ}")
+else:
+    st.caption(f"Última análise: {pd.to_datetime(cur['ts'], unit='s'):%d/%m/%Y %H:%M} UTC "
+               f"· janela de {WIN // 24} dias · projeção {PROJ}")
 
 st.subheader("Confiabilidade estrutural")
 st.caption("Estes quatro números dizem se as métricas abaixo significam algo "
@@ -295,15 +363,19 @@ with tc:
 with td:
     st.caption("Maior variação de betweenness em 48h. Precisa de pelo menos dois "
                "dias de snapshots acumulados para dizer algo.")
-    r = pd.DataFrame(sna.risers(SUB, WIN, PROJ, "betweenness", 48))
-    if r.empty or (r["delta"].abs().max() or 0) == 0:
-        st.info("Ainda sem histórico suficiente. Vai popular sozinho conforme o "
-                "workflow de análise acumula execuções.")
+    if FIXO:
+        st.info("Não se aplica a um período fixo: é uma única foto do "
+                "intervalo, sem série de snapshots do cron para comparar.")
     else:
-        st.dataframe(r, width="stretch", hide_index=True)
+        r = pd.DataFrame(sna.risers(SUB, WIN, PROJ, "betweenness", 48))
+        if r.empty or (r["delta"].abs().max() or 0) == 0:
+            st.info("Ainda sem histórico suficiente. Vai popular sozinho conforme o "
+                    "workflow de análise acumula execuções.")
+        else:
+            st.dataframe(r, width="stretch", hide_index=True)
 
 st.subheader("Reply graph" if PROJ == "reply" else "Grafo de co-participação")
-res = graph_layout(SUB, WIN, PROJ)
+res = graph_layout(SUB, WIN, PROJ, now=NOW_TS if FIXO else None)
 if res:
     edges, pos, total_nos = res
     if total_nos > len(pos):
@@ -339,7 +411,8 @@ st.caption(
     "Papel de engajamento vem do k-core e do grau. Liderança combina respostas "
     "recebidas, menções e engajamento gerado nos posts próprios.")
 
-part, subs_df, mentions_df, text_rows, flair_rows = role_data(SUB, WIN)
+part, subs_df, mentions_df, text_rows, flair_rows = role_data(
+    SUB, WIN, now=NOW_TS if FIXO else None, end=END_BOUND)
 
 at = actors.copy()
 
@@ -445,7 +518,7 @@ st.dataframe(
         "w_in_degree": "respostas recebidas", "líder": "líder da tribo"})
 
 st.download_button(
-    "Baixar tabela (CSV)", tabela.to_csv(index=False).encode("utf-8"),
+    "Baixar tabela (CSV)", _csv_safe(tabela).to_csv(index=False).encode("utf-8"),
     file_name=f"{SUB}_tribos_liderancas_{WIN // 24}d.csv", mime="text/csv")
 
 st.subheader("Tópicos recorrentes")
@@ -506,16 +579,20 @@ elif eixo == "Por flair":
         st.caption("Este subreddit não usa flair nos posts.")
     else:
         flair_escolhido = st.selectbox("Flair", flairs)
-        comentarios = Counter({r["term"]: r["n"] for r in term_freqs_data(SUB, WIN, flair=flair_escolhido)})
-        titulos = sna.word_frequencies([r["title"] for r in title_freqs_data(SUB, WIN, flair=flair_escolhido)])
+        comentarios = Counter({r["term"]: r["n"] for r in term_freqs_data(
+            SUB, WIN, flair=flair_escolhido, now=NOW_TS if FIXO else None, end=END_BOUND)})
+        titulos = sna.word_frequencies([r["title"] for r in title_freqs_data(
+            SUB, WIN, flair=flair_escolhido, now=NOW_TS if FIXO else None, end=END_BOUND)])
         freqs = dict(comentarios + titulos)
         rotulo = f"flair {flair_escolhido}"
         st.caption(f"Comentários (acumulados dia a dia) + títulos de post com este flair, "
                    f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
 
 else:  # Todo o subreddit
-    comentarios = Counter({r["term"]: r["n"] for r in term_freqs_data(SUB, WIN)})
-    titulos = sna.word_frequencies([r["title"] for r in title_freqs_data(SUB, WIN)])
+    comentarios = Counter({r["term"]: r["n"] for r in term_freqs_data(
+        SUB, WIN, now=NOW_TS if FIXO else None, end=END_BOUND)})
+    titulos = sna.word_frequencies([r["title"] for r in title_freqs_data(
+        SUB, WIN, now=NOW_TS if FIXO else None, end=END_BOUND)])
     freqs = dict(comentarios + titulos)
     st.caption(f"Comentários (acumulados dia a dia) + títulos de post de todos os flairs, "
                f"somados nos últimos {WIN // 24} dias — mesma janela das demais análises.")
@@ -549,14 +626,18 @@ st.caption(
     "para responder se os tópicos se alinham com as tribos estruturais e "
     "quais termos parecem específicos de um grupo ou contexto. Usa o texto "
     "vivo dos comentários — sobrevive só 7 dias na política de retenção do "
-    "banco — então cobre a última semana, não a janela de "
-    f"{WIN // 24} dias escolhida na barra lateral. Sentimento é por léxico "
-    "PT-BR (contagem de palavra positiva/negativa): é um sinal aproximado, "
-    "não entende negação, ironia ou sarcasmo — trate como indício agregado "
-    "por tópico, não como classificação individual confiável de um "
-    "comentário específico.")
+    "banco — então cobre só essa fatia recente, "
+    + (f"o que quase certamente NÃO inclui o período fixo {PERIODO_NOME}: "
+       "se as tabelas abaixo vierem vazias, é isso — o corpo do comentário "
+       "já foi apagado, não um erro." if FIXO else
+       f"não a janela de {WIN // 24} dias escolhida na barra lateral.")
+    + " Sentimento é por léxico PT-BR (contagem de palavra positiva/negativa): "
+    "é um sinal aproximado, não entende negação, ironia ou sarcasmo — trate "
+    "como indício agregado por tópico, não como classificação individual "
+    "confiável de um comentário específico.")
 
-rows_7d = text_signal_rows(SUB)
+rows_7d = (text_signal_rows(SUB, start=PERIOD_START, end=PERIOD_END) if FIXO
+           else text_signal_rows(SUB))
 if not rows_7d:
     st.caption("Sem comentários com corpo ainda vivo para classificar.")
 else:
@@ -574,7 +655,7 @@ else:
             "palavras_principais": "palavras principais",
             "topico": "tópico", "tribo": "tribo", "sentimento": "sentimento"})
     st.download_button(
-        "Baixar classificação completa (CSV)", df_class.to_csv(index=False).encode("utf-8"),
+        "Baixar classificação completa (CSV)", _csv_safe(df_class).to_csv(index=False).encode("utf-8"),
         file_name=f"{SUB}_classificacao_conversas_7d.csv", mime="text/csv")
 
     st.subheader("Sentimento por tópico")
