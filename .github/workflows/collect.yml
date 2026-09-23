@@ -34,7 +34,7 @@ jobs:
           if [ -n "$BACKFILL_DAYS" ]; then
             python collector.py backfill --days "$BACKFILL_DAYS"
           else
-            python collector.py poll --lookback 180
+            python collector.py poll --lookback 720
           fi
         env:
           DATABASE_URL:     ${{ secrets.DATABASE_URL }}

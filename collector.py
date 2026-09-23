@@ -112,7 +112,10 @@ def poll(sub, lookback_minutes=180):
 
     newest = db.latest_comment_ts(sub)
     print(f"  {nc} comentarios, {np_} posts")
-    if newest:
+    if newest is None:
+        print("  AVISO: nenhum comentario no banco para este subreddit — "
+              "nome errado ou banco vazio? Rode um backfill.", file=sys.stderr)
+    else:
         lag = (now - newest) / 60
         print(f"  atraso da fonte: {lag:.0f} min")
         if lag > lookback_minutes * 0.7:

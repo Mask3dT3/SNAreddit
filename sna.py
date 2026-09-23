@@ -340,8 +340,7 @@ def record_text_signals(sub, now=None, lookback_hours=3):
                   "term": term, "n": n}
                  for (day, flair), counter in by_day_flair.items()
                  for term, n in counter.items()]
-    n_terms = db.upsert_daily_terms(out_terms)
-    db.mark_terms_seen(novos_ids, now)
+    n_terms = db.record_daily_terms_and_mark_seen(out_terms, novos_ids, now)
 
     print(f"  sinais de texto: {n_mentions} mencoes, {n_terms} termos/dia "
           f"({len(frescos)} comentarios novos, varredura de {lookback_hours}h)")
@@ -634,10 +633,14 @@ if __name__ == "__main__":
     ap.add_argument("--projection", choices=list(PROJECTIONS) + ["all"], default="all")
     ap.add_argument("--no-prune", action="store_true")
     ap.add_argument("--skip-mentions", action="store_true")
-    ap.add_argument("--mentions-lookback", type=int, default=3,
+    ap.add_argument("--mentions-lookback", type=int, default=12,
                      help="horas varridas por record_text_signals (mencoes + "
-                          "termos/dia); use um valor alto (ex: 168) uma unica "
-                          "vez para semear o historico atual antes que o body expire")
+                          "termos/dia). Default 12h porque o cron real roda a "
+                          "cada ~3h30 em media (nao os 30 min nominais do "
+                          "agendamento — GitHub Actions atrasa sob carga), "
+                          "entao 3h perdia comentario com regularidade. Use um "
+                          "valor alto (ex: 168) uma unica vez para semear o "
+                          "historico atual antes que o body expire")
     a = ap.parse_args()
     if not a.sub:
         sys.exit("informe --sub ou defina TARGET_SUBREDDIT")

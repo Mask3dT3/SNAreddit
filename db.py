@@ -178,22 +178,33 @@ def unseen_comment_ids(ids):
     return set(ids) - {r["comment_id"] for r in rows}
 
 
-def mark_terms_seen(ids, now):
-    return _bulk(
-        "insert into terms_seen (comment_id, seen_utc) values (%(comment_id)s, %(seen_utc)s) "
-        "on conflict (comment_id) do nothing",
-        [{"comment_id": i, "seen_utc": now} for i in ids])
-
-
-def upsert_daily_terms(rows):
-    """Soma no que ja existe (nao substitui) — cada linha e um dia+flair+termo,
-    acumulado ao longo do tempo a partir dos comentarios ainda nao vistos."""
-    return _bulk(
-        """insert into daily_terms (day, subreddit, flair, term, n)
-           values (%(day)s, %(subreddit)s, %(flair)s, %(term)s, %(n)s)
-           on conflict (day, subreddit, flair, term) do update
-             set n = daily_terms.n + excluded.n""",
-        rows)
+def record_daily_terms_and_mark_seen(term_rows, ids, now):
+    """
+    Upsert de daily_terms (aditivo) e marca de terms_seen NA MESMA transacao.
+    Antes eram duas chamadas de _bulk separadas (duas transacoes): se o
+    processo morresse entre uma e outra — e analyze.yml usa
+    cancel-in-progress, que cancela exatamente assim no meio — o proximo run
+    recontava os mesmos comentarios como "nao vistos" e inflava n pra
+    sempre, sem como desfazer (upsert_daily_terms e aditivo, nao idempotente
+    como mentions). Uma so transacao garante tudo-ou-nada.
+    """
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if term_rows:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    """insert into daily_terms (day, subreddit, flair, term, n)
+                       values (%(day)s, %(subreddit)s, %(flair)s, %(term)s, %(n)s)
+                       on conflict (day, subreddit, flair, term) do update
+                         set n = daily_terms.n + excluded.n""",
+                    term_rows, page_size=500)
+            if ids:
+                psycopg2.extras.execute_batch(
+                    cur,
+                    "insert into terms_seen (comment_id, seen_utc) values "
+                    "(%(comment_id)s, %(seen_utc)s) on conflict (comment_id) do nothing",
+                    [{"comment_id": i, "seen_utc": now} for i in ids], page_size=500)
+    return len(term_rows)
 
 
 def subreddit_flairs(sub):
@@ -335,6 +346,9 @@ def db_size_mb():
 
 
 def latest_comment_ts(subreddit):
+    """None quando nao ha nenhum comentario — nao inventa 'ha 1h atras', que
+    mascarava justamente o caso que collector.py precisa detectar (banco
+    vazio ou nome de subreddit errado)."""
     r = query("select max(created_utc) as t from comments where subreddit=%s",
               (subreddit.lower(),))
-    return (r[0]["t"] if r and r[0]["t"] else time.time() - 3600)
+    return r[0]["t"] if r and r[0]["t"] else None

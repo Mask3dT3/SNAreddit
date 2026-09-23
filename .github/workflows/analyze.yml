@@ -16,7 +16,10 @@ on:
 
 concurrency:
   group: analyze
-  cancel-in-progress: true
+  # false, nao true: cancelar no meio pode interromper record_text_signals
+  # entre gravar daily_terms (aditivo) e marcar terms_seen, inflando a
+  # contagem de termo pra sempre no proximo run.
+  cancel-in-progress: false
 
 jobs:
   snapshot:
@@ -39,3 +42,23 @@ jobs:
           DATABASE_URL:            ${{ secrets.DATABASE_URL }}
           TARGET_SUBREDDIT:        ${{ vars.TARGET_SUBREDDIT }}
           MENTIONS_LOOKBACK_HOURS: ${{ github.event.inputs.mentions_lookback_hours }}
+      # Canario: converte silencio em falha visivel (e-mail nativo do
+      # GitHub Actions). Sem isto, um collector quebrado que grava 0 linhas
+      # sai com exit 0 e ninguem percebe ate abrir o dashboard manualmente.
+      - run: |
+          python -c "
+          import sys, time
+          import db
+          ts = db.latest_comment_ts('$TARGET_SUBREDDIT')
+          if ts is None:
+              print('CANARIO: nenhum comentario no banco para este subreddit', file=sys.stderr)
+              sys.exit(1)
+          atraso_h = (time.time() - ts) / 3600
+          print(f'canario: comentario mais recente ha {atraso_h:.1f}h')
+          if atraso_h > 6:
+              print(f'CANARIO: comentario mais recente ha {atraso_h:.1f}h — pipeline pode ter parado', file=sys.stderr)
+              sys.exit(1)
+          "
+        env:
+          DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+          TARGET_SUBREDDIT: ${{ vars.TARGET_SUBREDDIT }}

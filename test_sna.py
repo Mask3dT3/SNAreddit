@@ -4,6 +4,8 @@ Rodar com:  python -m unittest test_sna.py -v
 """
 import unittest
 
+import networkx as nx
+
 import sna
 
 
@@ -89,6 +91,60 @@ class TopTermsTest(unittest.TestCase):
         termos = dict(sna.top_terms(["uso muito o reddit para aprender, ótimo subreddit"], top_n=20))
         self.assertNotIn("reddit", termos)
         self.assertNotIn("subreddit", termos)
+
+
+class GiniTest(unittest.TestCase):
+    def test_lista_vazia_e_zero(self):
+        self.assertEqual(sna._gini([]), 0.0)
+
+    def test_todos_iguais_e_zero(self):
+        self.assertEqual(sna._gini([5, 5, 5, 5]), 0.0)
+
+    def test_soma_zero_e_zero(self):
+        self.assertEqual(sna._gini([0, 0, 0]), 0.0)
+
+    def test_um_dominante_se_aproxima_de_um(self):
+        valores = [100] + [1] * 9   # um autor domina, resto quase nada
+        self.assertGreater(sna._gini(valores), 0.7)
+
+
+class ComputeMetricsTest(unittest.TestCase):
+    def test_grafo_pequeno_devolve_vazio(self):
+        G = nx.DiGraph()
+        G.add_edge("a", "b")   # so 2 nos: abaixo do minimo de 3
+        self.assertEqual(sna.compute_metrics(G), ({}, {}))
+
+    def test_grafo_dirigido_totalmente_reciproco(self):
+        G = nx.DiGraph()
+        G.add_weighted_edges_from([("a", "b", 1), ("b", "a", 1),
+                                    ("b", "c", 1), ("c", "b", 1)])
+        gm, actors = sna.compute_metrics(G)
+        self.assertEqual(gm["n_nodes"], 3)
+        self.assertAlmostEqual(gm["reciprocity"], 1.0)
+        self.assertEqual(set(actors), {"a", "b", "c"})
+
+    def test_grafo_nao_dirigido_reciprocidade_e_none(self):
+        G = nx.Graph()
+        G.add_weighted_edges_from([("a", "b", 1), ("b", "c", 1), ("a", "c", 1)])
+        gm, _ = sna.compute_metrics(G)
+        self.assertIsNone(gm["reciprocity"])
+
+    def test_componentes_desconectados_contam_certo(self):
+        G = nx.DiGraph()
+        G.add_weighted_edges_from([("a", "b", 1), ("b", "a", 1)])
+        G.add_weighted_edges_from([("x", "y", 1), ("y", "x", 1)])
+        gm, _ = sna.compute_metrics(G)
+        self.assertEqual(gm["n_components"], 2)
+        self.assertAlmostEqual(gm["giant_frac"], 0.5)
+
+    def test_actors_tem_todas_as_chaves_esperadas(self):
+        G = nx.DiGraph()
+        G.add_weighted_edges_from([("a", "b", 1), ("b", "a", 1), ("b", "c", 1)])
+        _, actors = sna.compute_metrics(G)
+        for m in actors.values():
+            for chave in ("in_degree", "out_degree", "w_in_degree",
+                          "pagerank", "betweenness", "coreness", "community"):
+                self.assertIn(chave, m)
 
 
 class WordFrequenciesTest(unittest.TestCase):

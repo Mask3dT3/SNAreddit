@@ -107,7 +107,9 @@ create index if not exists idx_comments_created on comments(subreddit, created_u
 create index if not exists idx_comments_author  on comments(subreddit, author);
 create index if not exists idx_comments_parent  on comments(parent_id);
 create index if not exists idx_subs_created     on submissions(subreddit, created_utc);
-create index if not exists idx_actor_snap       on actor_snapshots(subreddit, window_hours, ts);
+-- projection entra no indice porque toda leitura filtra por ela (app.py e
+-- sna.risers); sem isso o Postgres varre as duas projecoes e descarta metade.
+create index if not exists idx_actor_snap       on actor_snapshots(subreddit, window_hours, projection, ts desc);
 create index if not exists idx_graph_snap       on graph_snapshots(subreddit, window_hours, ts);
 create index if not exists idx_mentions_target  on mentions(subreddit, target_author, created_utc);
 create index if not exists idx_mentions_created on mentions(created_utc);
@@ -123,8 +125,12 @@ begin
     delete from comments
      where created_utc < extract(epoch from now()) - 120*86400;
 
+    -- 7 dias, nao 45: nenhuma tela usa historico de ator alem do snapshot mais
+    -- recente (app.py) e de uma janela de 48h (sna.risers). Com 2 projecoes x 3
+    -- janelas x ~3.500 autores por execucao, cada dia retido custa dezenas de MB
+    -- — 45 dias estouravam sozinhos os 500 MB do free tier.
     delete from actor_snapshots
-     where ts < extract(epoch from now()) - 45*86400;
+     where ts < extract(epoch from now()) - 7*86400;
 
     delete from graph_snapshots
      where ts < extract(epoch from now()) - 365*86400;
