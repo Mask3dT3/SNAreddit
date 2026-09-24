@@ -9,12 +9,10 @@ import html
 import io
 import json
 import time
-import math
 from collections import Counter
 from datetime import datetime, timezone
 
 import pandas as pd
-import networkx as nx
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -166,26 +164,22 @@ def exercise_sample(sub, start, end, n=15):
 
 
 _NODE_COLORS = {"Usuário": "#2a9d8f", "Post/Conteúdo": "#e76f51"}
+_COMMUNITY_PALETTE = ["#e76f51", "#2a9d8f", "#e9c46a", "#264653", "#8ab17d",
+                      "#f4a261", "#5c4d7d", "#ff6b6b", "#118ab2", "#c9184a"]
 
 
-def _vis_network_html(nos, arestas, height=460):
-    """Grafo interativo (arrastar, zoom) via vis-network — o equivalente
-    visual do que Kumu/Gephi mostrariam a partir das mesmas duas tabelas,
-    sem depender de conta externa (Kumu) ou app desktop (Gephi).
+def _community_color(c):
+    return "#adb5bd" if c is None or c == -1 else _COMMUNITY_PALETTE[int(c) % len(_COMMUNITY_PALETTE)]
 
-    O nome do no (autor ou titulo de post real, texto livre e adversario por
-    natureza) so entra em `label`, desenhado num <canvas> — imune a HTML.
-    `title` (o tooltip on-hover) o vis-network insere via innerHTML, entao
-    precisa ser escapado — sem isso um titulo de post tipo
-    "<img src=x onerror=...>" executaria dentro do tooltip.
-    """
-    nodes = [{"id": n["nome"], "label": n["nome"],
-              "color": _NODE_COLORS.get(n["categoria"], "#8d99ae"),
-              "shape": "dot" if n["categoria"] == "Usuário" else "square",
-              "title": f"{html.escape(n['nome'])} ({html.escape(n['categoria'])})"} for n in nos]
-    edges = [{"from": a["fonte"], "to": a["destino"], "width": a["peso"],
-              "arrows": "to", "title": f"{html.escape(a['tipo_interacao'])} (peso {a['peso']})"}
-             for a in arestas]
+
+def _vis_network(nodes, edges, height=460):
+    """Renderer generico via vis-network (arrastar, zoom, física de mola) —
+    o mesmo tipo de visual que Kumu/Gephi produzem, embutido no dashboard
+    sem depender de conta externa (Kumu) ou app desktop (Gephi). Espera
+    `nodes`/`edges` já no formato do vis-network (id/label/color/... e
+    from/to/width/...) com qualquer `title` (tooltip) já escapado — o
+    vis-network insere `title` via innerHTML, então texto adversário (nome
+    de post/autor real) que chegar cru aqui vira XSS."""
     nodes_json = json.dumps(nodes, ensure_ascii=False).replace("</", "<\\/")
     edges_json = json.dumps(edges, ensure_ascii=False).replace("</", "<\\/")
     return f"""
@@ -202,8 +196,30 @@ def _vis_network_html(nos, arestas, height=460):
         interaction: {{hover: true, dragNodes: true, zoomView: true}},
         edges: {{smooth: {{type: "continuous"}}, color: "rgba(120,120,120,0.5)"}}
       }});
+      // a fisica espalha os nos pra fora do enquadramento inicial —
+      // sem isso alguns nos ficam fora da vista ate o usuario dar zoom out.
+      network.once("stabilizationIterationsDone", function () {{ network.fit(); }});
+      setTimeout(function () {{ network.fit(); }}, 1500);
     </script>
     """
+
+
+def _vis_network_html(nos, arestas, height=460):
+    """Nós/arestas do exercício (sna.exercise_nodes_edges) -> vis-network.
+
+    O nome do nó (autor ou título de post real, texto livre e adversário por
+    natureza) só entra em `label`, desenhado num <canvas> — imune a HTML.
+    `title` precisa ser escapado (ver _vis_network) — sem isso um título de
+    post tipo "<img src=x onerror=...>" executaria dentro do tooltip.
+    """
+    nodes = [{"id": n["nome"], "label": n["nome"],
+              "color": _NODE_COLORS.get(n["categoria"], "#8d99ae"),
+              "shape": "dot" if n["categoria"] == "Usuário" else "square",
+              "title": f"{html.escape(n['nome'])} ({html.escape(n['categoria'])})"} for n in nos]
+    edges = [{"from": a["fonte"], "to": a["destino"], "width": a["peso"],
+              "arrows": "to", "title": f"{html.escape(a['tipo_interacao'])} (peso {a['peso']})"}
+             for a in arestas]
+    return _vis_network(nodes, edges, height)
 
 
 @st.cache_data(ttl=300)
@@ -217,14 +233,16 @@ def role_data(sub, win, now=None, end=None):
 
 @st.cache_data(ttl=300, show_spinner="Montando o grafo...")
 def graph_layout(sub, win, proj, now=None, top_n=120):
+    """Nós/arestas do grafo pra render vis-network — a física de mola roda
+    no navegador (vis-network), não aqui, então não precisa de spring_layout
+    do networkx: só o essencial (arestas com peso, lista de nós, total)."""
     G = sna.BUILDERS[proj](sub, win, now=now)
     if G.number_of_nodes() < 3:
         return None
     total = G.number_of_nodes()
     keep = sorted(G.nodes(), key=lambda v: -G.degree(v, weight="weight"))[:top_n]
     H = G.subgraph(keep).copy()
-    pos = nx.spring_layout(H, k=1.6 / math.sqrt(max(len(H), 1)), seed=42, iterations=60)
-    return list(H.edges()), {v: (float(p[0]), float(p[1])) for v, p in pos.items()}, total
+    return list(H.edges(data="weight", default=1)), list(H.nodes()), total
 
 
 # ------------------------------------------------------------------ layout
@@ -472,31 +490,21 @@ with td:
 st.subheader("Reply graph" if PROJ == "reply" else "Grafo de co-participação")
 res = graph_layout(SUB, WIN, PROJ, now=NOW_TS if FIXO else None)
 if res:
-    edges, pos, total_nos = res
-    if total_nos > len(pos):
-        st.caption(f"Mostrando os {len(pos)} participantes mais conectados de {total_nos}.")
+    edges, ns, total_nos = res
+    if total_nos > len(ns):
+        st.caption(f"Mostrando os {len(ns)} participantes mais conectados de {total_nos}.")
     comm = dict(zip(actors["author"], actors["community"]))
     prk = dict(zip(actors["author"], actors["pagerank"]))
-    ex, ey = [], []
-    for a, b in edges:
-        if a in pos and b in pos:
-            ex += [pos[a][0], pos[b][0], None]
-            ey += [pos[a][1], pos[b][1], None]
-    ns = list(pos.keys())
     smax = max([prk.get(v, 0) for v in ns] + [1e-9])
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=ex, y=ey, mode="lines", hoverinfo="skip",
-                             line=dict(width=0.4, color="rgba(150,150,150,0.35)")))
-    fig.add_trace(go.Scatter(
-        x=[pos[v][0] for v in ns], y=[pos[v][1] for v in ns],
-        mode="markers", hoverinfo="text",
-        text=[f"u/{v}<br>comunidade {comm.get(v, -1)}<br>pagerank {prk.get(v, 0):.4f}" for v in ns],
-        marker=dict(size=[8 + 40 * prk.get(v, 0) / smax for v in ns],
-                    color=[comm.get(v, -1) for v in ns], colorscale="Turbo",
-                    line=dict(width=0.5, color="white"))))
-    fig.update_layout(height=430, showlegend=False, margin=dict(t=5, b=5, l=0, r=0),
-                      xaxis=dict(visible=False), yaxis=dict(visible=False))
-    st.plotly_chart(fig, width="stretch")
+    wmax = max([w for _, _, w in edges] + [1])
+    nodes_vn = [{"id": v, "label": v, "color": _community_color(comm.get(v, -1)),
+                 "size": 10 + 25 * prk.get(v, 0) / smax,
+                 "title": html.escape(f"u/{v} · comunidade {comm.get(v, -1)} · "
+                                      f"pagerank {prk.get(v, 0):.4f}")} for v in ns]
+    edges_vn = [{"from": a, "to": b, "width": 0.5 + 4 * (w / wmax)} for a, b, w in edges]
+    st.caption("Arraste os nós, dê zoom — cor = tribo (comunidade do Louvain), "
+               "tamanho = pagerank, espessura da linha = peso da interação.")
+    components.html(_vis_network(nodes_vn, edges_vn, height=480), height=500, scrolling=False)
 
 st.divider()
 st.subheader("Tribos e lideranças")
@@ -841,18 +849,28 @@ else:
         df_nos = pd.DataFrame(tabela_nos)
         st.dataframe(df_nos, hide_index=True, width="stretch",
                     column_config={"id": "ID", "nome": "Nome/Perfil", "categoria": "Categoria"})
+        # Label/Type: cabeçalhos que o Kumu reconhece e mapeia sozinho ao
+        # importar — sem isso ele pede pra mapear coluna a coluna na mão.
+        df_nos_kumu = df_nos.rename(columns={"nome": "Label", "categoria": "Type"})[["Label", "Type"]]
         st.download_button(
-            "Baixar nós (CSV)", _csv_safe(df_nos).to_csv(index=False).encode("utf-8"),
-            file_name=f"{SUB}_nos.csv", mime="text/csv")
+            "Baixar nós p/ Kumu (CSV)", _csv_safe(df_nos_kumu).to_csv(index=False).encode("utf-8"),
+            file_name="Elements.csv", mime="text/csv")
     with col_arestas:
         st.caption("Tabela de arestas (conexões)")
         df_arestas = pd.DataFrame(tabela_arestas)
         st.dataframe(df_arestas, hide_index=True, width="stretch",
                     column_config={"fonte": "Fonte", "destino": "Destino",
                                    "tipo_interacao": "Tipo de Interação", "peso": "Peso"})
+        # From/To/Type/Strength: mesma ideia do Elements.csv, pro lado das
+        # conexões — Gephi importa os dois arquivos também, só pede pra
+        # mapear Source/Target/Weight na hora do import (ele não tem um
+        # cabeçalho nativo fixo como o Kumu).
+        df_arestas_kumu = df_arestas.rename(columns={
+            "fonte": "From", "destino": "To", "tipo_interacao": "Type", "peso": "Strength"
+        })[["From", "To", "Type", "Strength"]]
         st.download_button(
-            "Baixar arestas (CSV)", _csv_safe(df_arestas).to_csv(index=False).encode("utf-8"),
-            file_name=f"{SUB}_arestas.csv", mime="text/csv")
+            "Baixar arestas p/ Kumu (CSV)", _csv_safe(df_arestas_kumu).to_csv(index=False).encode("utf-8"),
+            file_name="Connections.csv", mime="text/csv")
 
     st.caption(
         "Grafo interativo (arraste os nós, dê zoom) — o equivalente visual do "
