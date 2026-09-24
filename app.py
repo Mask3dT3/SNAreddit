@@ -9,10 +9,12 @@ import html
 import io
 import json
 import time
+import math
 from collections import Counter
 from datetime import datetime, timezone
 
 import pandas as pd
+import networkx as nx
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
@@ -164,12 +166,6 @@ def exercise_sample(sub, start, end, n=15):
 
 
 _NODE_COLORS = {"Usuário": "#2a9d8f", "Post/Conteúdo": "#e76f51"}
-_COMMUNITY_PALETTE = ["#e76f51", "#2a9d8f", "#e9c46a", "#264653", "#8ab17d",
-                      "#f4a261", "#5c4d7d", "#ff6b6b", "#118ab2", "#c9184a"]
-
-
-def _community_color(c):
-    return "#adb5bd" if c is None or c == -1 else _COMMUNITY_PALETTE[int(c) % len(_COMMUNITY_PALETTE)]
 
 
 def _vis_network(nodes, edges, height=460):
@@ -183,7 +179,13 @@ def _vis_network(nodes, edges, height=460):
     nodes_json = json.dumps(nodes, ensure_ascii=False).replace("</", "<\\/")
     edges_json = json.dumps(edges, ensure_ascii=False).replace("</", "<\\/")
     return f"""
-    <div id="rede" style="height:{height}px;border:1px solid #ddd;border-radius:8px;"></div>
+    <style>
+      /* sem isso, navegador em modo escuro pinta o documento sem estilo de
+         preto e a label do no (preta, cor padrao do vis-network) some. */
+      html, body {{ background: #fff; color-scheme: light; margin: 0; }}
+    </style>
+    <div id="rede" style="height:{height}px;background:#fff;
+                          border:1px solid #ddd;border-radius:8px;"></div>
     <script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"
             integrity="sha384-yxKDWWf0wwdUj/gPeuL11czrnKFQROnLgY8ll7En9NYoXibgg3C6NK/UDHNtUgWJ"
             crossorigin="anonymous"></script>
@@ -192,8 +194,10 @@ def _vis_network(nodes, edges, height=460):
       var edges = new vis.DataSet({edges_json});
       var container = document.getElementById("rede");
       var network = new vis.Network(container, {{nodes: nodes, edges: edges}}, {{
-        physics: {{stabilization: true}},
+        physics: {{stabilization: true,
+                  barnesHut: {{springLength: 160, avoidOverlap: 0.6}}}},
         interaction: {{hover: true, dragNodes: true, zoomView: true}},
+        nodes: {{font: {{size: 15, color: "#222"}}}},
         edges: {{smooth: {{type: "continuous"}}, color: "rgba(120,120,120,0.5)"}}
       }});
       // a fisica espalha os nos pra fora do enquadramento inicial —
@@ -233,16 +237,14 @@ def role_data(sub, win, now=None, end=None):
 
 @st.cache_data(ttl=300, show_spinner="Montando o grafo...")
 def graph_layout(sub, win, proj, now=None, top_n=120):
-    """Nós/arestas do grafo pra render vis-network — a física de mola roda
-    no navegador (vis-network), não aqui, então não precisa de spring_layout
-    do networkx: só o essencial (arestas com peso, lista de nós, total)."""
     G = sna.BUILDERS[proj](sub, win, now=now)
     if G.number_of_nodes() < 3:
         return None
     total = G.number_of_nodes()
     keep = sorted(G.nodes(), key=lambda v: -G.degree(v, weight="weight"))[:top_n]
     H = G.subgraph(keep).copy()
-    return list(H.edges(data="weight", default=1)), list(H.nodes()), total
+    pos = nx.spring_layout(H, k=1.6 / math.sqrt(max(len(H), 1)), seed=42, iterations=60)
+    return list(H.edges()), {v: (float(p[0]), float(p[1])) for v, p in pos.items()}, total
 
 
 # ------------------------------------------------------------------ layout
@@ -490,21 +492,31 @@ with td:
 st.subheader("Reply graph" if PROJ == "reply" else "Grafo de co-participação")
 res = graph_layout(SUB, WIN, PROJ, now=NOW_TS if FIXO else None)
 if res:
-    edges, ns, total_nos = res
-    if total_nos > len(ns):
-        st.caption(f"Mostrando os {len(ns)} participantes mais conectados de {total_nos}.")
+    edges, pos, total_nos = res
+    if total_nos > len(pos):
+        st.caption(f"Mostrando os {len(pos)} participantes mais conectados de {total_nos}.")
     comm = dict(zip(actors["author"], actors["community"]))
     prk = dict(zip(actors["author"], actors["pagerank"]))
+    ex, ey = [], []
+    for a, b in edges:
+        if a in pos and b in pos:
+            ex += [pos[a][0], pos[b][0], None]
+            ey += [pos[a][1], pos[b][1], None]
+    ns = list(pos.keys())
     smax = max([prk.get(v, 0) for v in ns] + [1e-9])
-    wmax = max([w for _, _, w in edges] + [1])
-    nodes_vn = [{"id": v, "label": v, "color": _community_color(comm.get(v, -1)),
-                 "size": 10 + 25 * prk.get(v, 0) / smax,
-                 "title": html.escape(f"u/{v} · comunidade {comm.get(v, -1)} · "
-                                      f"pagerank {prk.get(v, 0):.4f}")} for v in ns]
-    edges_vn = [{"from": a, "to": b, "width": 0.5 + 4 * (w / wmax)} for a, b, w in edges]
-    st.caption("Arraste os nós, dê zoom — cor = tribo (comunidade do Louvain), "
-               "tamanho = pagerank, espessura da linha = peso da interação.")
-    components.html(_vis_network(nodes_vn, edges_vn, height=480), height=500, scrolling=False)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=ex, y=ey, mode="lines", hoverinfo="skip",
+                             line=dict(width=0.4, color="rgba(150,150,150,0.35)")))
+    fig.add_trace(go.Scatter(
+        x=[pos[v][0] for v in ns], y=[pos[v][1] for v in ns],
+        mode="markers", hoverinfo="text",
+        text=[f"u/{v}<br>comunidade {comm.get(v, -1)}<br>pagerank {prk.get(v, 0):.4f}" for v in ns],
+        marker=dict(size=[8 + 40 * prk.get(v, 0) / smax for v in ns],
+                    color=[comm.get(v, -1) for v in ns], colorscale="Turbo",
+                    line=dict(width=0.5, color="white"))))
+    fig.update_layout(height=430, showlegend=False, margin=dict(t=5, b=5, l=0, r=0),
+                      xaxis=dict(visible=False), yaxis=dict(visible=False))
+    st.plotly_chart(fig, width="stretch")
 
 st.divider()
 st.subheader("Tribos e lideranças")
