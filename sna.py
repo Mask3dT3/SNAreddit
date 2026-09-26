@@ -409,7 +409,9 @@ def classify_comments(rows, comm_of, tribo_labels, top_keywords=3):
     """
     Monta a tabela do exercicio (autor, texto, palavras principais, topico,
     tribo, sentimento) a partir de rows no formato de
-    db.recent_comments_with_body (id, author, body, created_utc, flair).
+    db.recent_comments_with_body (id, author, body, created_utc, flair),
+    opcionalmente com "tipo" (ver combine_text_items) — sem "tipo", cai em
+    "Comentário" pra nao quebrar chamada antiga.
     tribo_labels e o dict {community_id: nome} de sna.tribe_topics, para usar
     o MESMO rotulo de tribo ja exibido no resto do dashboard.
     """
@@ -426,9 +428,31 @@ def classify_comments(rows, comm_of, tribo_labels, top_keywords=3):
             "palavras_principais": principais,
             "topico": r.get("flair") or SEM_FLAIR, "tribo": tribo,
             "sentimento": label, "sentimento_score": score,
-            "created_utc": r["created_utc"],
+            "created_utc": r["created_utc"], "tipo": r.get("tipo", "Comentário"),
         })
     return out
+
+
+def combine_text_items(comment_rows, submission_rows):
+    """
+    Normaliza comentarios e posts pro mesmo formato de linha (id, author,
+    body, created_utc, flair, tipo, score) que classify_comments/
+    term_adoption/context_specific_terms ja esperam — pra analise textual
+    cobrir os dois tipos de item sem duplicar logica. Texto do post = titulo
+    + selftext (quando existe); prefixo em "id" evita colisao entre o
+    namespace de id de comentario e de post.
+    """
+    itens = [{**r, "id": f"c_{r['id']}", "tipo": "Comentário"} for r in comment_rows]
+    for r in submission_rows:
+        texto = r.get("title") or ""
+        if r.get("selftext"):
+            texto = f"{texto}\n{r['selftext']}"
+        itens.append({
+            "id": f"p_{r['id']}", "author": r.get("author"), "body": texto,
+            "created_utc": r["created_utc"], "flair": r.get("flair"),
+            "tipo": "Postagem", "score": r.get("score"),
+        })
+    return itens
 
 
 def sentiment_by_topic(classified):

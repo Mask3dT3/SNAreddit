@@ -227,6 +227,41 @@ def _vis_network_html(nos, arestas, height=460):
 
 
 @st.cache_data(ttl=300)
+def topic_signal_data(sub, win, now=None, end=None):
+    return db.topic_signal(sub, win, now=now, end=end)
+
+
+@st.cache_data(ttl=300)
+def fixed_summary_data(sub, win, now=None, end=None):
+    """Contagens literais (independentes da projeção de grafo escolhida na
+    barra lateral) para os top-5 de postagens/respostas dadas/respostas
+    recebidas do modo de período fixo."""
+    return (pd.DataFrame(db.participation_stats(sub, win, now=now, end=end)),
+            pd.DataFrame(db.submission_stats(sub, win, now=now, end=end)),
+            pd.DataFrame(db.replies_received(sub, win, now=now, end=end)))
+
+
+@st.cache_data(ttl=1800, show_spinner="Recuperando texto de posts históricos da Arctic Shift...")
+def raw_submissions_data(sub, start, end):
+    """
+    Espelha text_signal_rows, mas para posts: a linha de submissions nunca é
+    apagada por retenção, só falta selftext em posts coletados antes desta
+    coluna existir — recupera do arquivo da Arctic Shift sob demanda, sem
+    persistir. Devolve (rows, completo).
+    """
+    rows = db.raw_submissions(sub, start, end)
+    faltando = db.submissions_missing_selftext(sub, start, end, limit=MISSING_BODY_LIMIT)
+    if not faltando:
+        return rows, True
+    selftexts, completo = collector.fetch_post_selftexts(
+        sub, start, end, [r["id"] for r in faltando])
+    recuperados = {r["id"]: selftexts[r["id"]] for r in rows if r["id"] in selftexts}
+    rows = [{**r, "selftext": recuperados[r["id"]]} if r["id"] in recuperados else r
+            for r in rows]
+    return rows, completo and len(faltando) < MISSING_BODY_LIMIT
+
+
+@st.cache_data(ttl=300)
 def role_data(sub, win, now=None, end=None):
     now = now or time.time()
     return (pd.DataFrame(db.participation_stats(sub, win, now, end=end)),
@@ -372,6 +407,292 @@ rows_texto, texto_completo = text_signal_rows(SUB, TEXT_START, TEXT_END)
 
 cur = gs.iloc[-1]
 prev = gs.iloc[-2] if len(gs) > 1 else cur
+
+if FIXO:
+    st.caption(f"Período fixo: {PERIODO_NOME} · projeção {PROJ}")
+
+    comm_of = dict(zip(actors["author"], actors["community"]))
+    flair_rows = topic_signal_data(SUB, WIN, now=NOW_TS, end=END_BOUND)
+    topics = sna.tribe_topics(flair_rows, comm_of)
+    tribo_opcoes = sorted(set(topics.values())) + (
+        ["Sem tribo definida"] if -1 in comm_of.values() else [])
+
+    rows_posts, posts_completo = raw_submissions_data(SUB, PERIOD_START, PERIOD_END)
+
+    st.subheader("Top 5 por atividade")
+    part_df, subs_df, recv_df = fixed_summary_data(SUB, WIN, now=NOW_TS, end=END_BOUND)
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.caption("Mais postagens")
+        if subs_df.empty:
+            st.caption("Sem postagens no período.")
+        else:
+            st.dataframe(
+                subs_df.nlargest(5, "posts")[["author", "posts"]],
+                hide_index=True, width="stretch",
+                column_config={"author": "autor", "posts": "postagens"})
+    with t2:
+        st.caption("Mais respostas dadas")
+        if part_df.empty:
+            st.caption("Sem comentários no período.")
+        else:
+            st.dataframe(
+                part_df.nlargest(5, "respostas_dadas")[["author", "respostas_dadas"]],
+                hide_index=True, width="stretch",
+                column_config={"author": "autor", "respostas_dadas": "respostas dadas"})
+    with t3:
+        st.caption("Mais respostas recebidas")
+        if recv_df.empty:
+            st.caption("Ninguém recebeu resposta no período.")
+        else:
+            st.dataframe(
+                recv_df.nlargest(5, "respostas_recebidas"),
+                hide_index=True, width="stretch",
+                column_config={"author": "autor",
+                               "respostas_recebidas": "respostas recebidas"})
+    st.caption(
+        "Respostas dadas/recebidas contam toda resposta de comentário (a "
+        "outro comentário ou a um post), independente da projeção de grafo "
+        "escolhida na barra lateral — que só afeta a nuvem de palavras por "
+        "tribo, abaixo.")
+
+    st.subheader("Nuvem de palavras de uma tribo")
+    st.caption(
+        "Tribo = comunidade do Louvain na projeção escolhida na barra "
+        "lateral, rotulada pelo flair predominante dos posts que ela "
+        "comenta. Cobre comentários e posts (título + texto) dos membros "
+        "da tribo no período.")
+    if not tribo_opcoes:
+        st.caption("Sem tribos identificadas nesta projeção/período.")
+    else:
+        tribo_escolhida = st.selectbox("Tribo", tribo_opcoes)
+        comm_ids = [c for c, t in topics.items() if t == tribo_escolhida] or (
+            [-1] if tribo_escolhida == "Sem tribo definida" else [])
+        bodies_tribo = (
+            [r["body"] for r in rows_texto if comm_of.get(r["author"]) in comm_ids]
+            + [f"{r.get('title') or ''} {r.get('selftext') or ''}"
+               for r in rows_posts if comm_of.get(r["author"]) in comm_ids])
+        freqs_tribo = dict(sna.top_terms(bodies_tribo, top_n=200))
+        if freqs_tribo:
+            nuvem = WordCloud(width=1000, height=460, background_color="white",
+                              colormap="Dark2", max_words=80, relative_scaling=0.4,
+                              prefer_horizontal=0.95).generate_from_frequencies(freqs_tribo)
+            with st.container(border=True):
+                st.image(nuvem.to_array(), width="stretch")
+                st.caption(f"Figura — nuvem de palavras de r/{SUB} (tribo {tribo_escolhida}).")
+            png_buf = io.BytesIO()
+            nuvem.to_image().save(png_buf, format="PNG")
+            st.download_button(
+                "Baixar nuvem (PNG)", png_buf.getvalue(),
+                file_name=f"{SUB}_nuvem_{tribo_escolhida.replace(' ', '_')}.png",
+                mime="image/png")
+        else:
+            st.caption("Sem dado suficiente para montar a nuvem desta tribo.")
+
+    st.subheader("Tópicos mais recorrentes")
+    st.caption(
+        "Este subreddit não usa hashtag — flair (rótulo do post) é o "
+        "equivalente real aqui. Volume = comentários feitos em posts com "
+        "aquele flair, no período.")
+    flair_volume = Counter(r["flair"] for r in flair_rows if r.get("flair"))
+    if flair_volume:
+        top10_topicos = pd.DataFrame(flair_volume.most_common(10), columns=["flair", "comentários"])
+        st.plotly_chart(
+            go.Figure(go.Bar(x=top10_topicos["comentários"], y=top10_topicos["flair"], orientation="h"))
+              .update_layout(height=max(220, 28 * len(top10_topicos)),
+                             margin=dict(t=10, b=10, l=0, r=0),
+                             yaxis=dict(autorange="reversed")),
+            width="stretch")
+    else:
+        st.caption("Este subreddit não usa flair nos posts — sem eixo de tópico pra medir.")
+
+    st.subheader("Palavras-chave mais recorrentes")
+    st.caption(
+        "Top 10 termos do período inteiro (comentários + títulos e texto "
+        "dos posts), com stopwords removidas.")
+    comentarios_freq = Counter({r["term"]: r["n"] for r in term_freqs_data(SUB, WIN, now=NOW_TS, end=END_BOUND)})
+    posts_freq = sna.word_frequencies(
+        [f"{r.get('title') or ''} {r.get('selftext') or ''}" for r in rows_posts])
+    freqs_globais = dict(comentarios_freq + posts_freq)
+    if freqs_globais:
+        st.dataframe(
+            pd.DataFrame(sorted(freqs_globais.items(), key=lambda x: -x[1])[:10],
+                         columns=["termo", "ocorrências"]),
+            hide_index=True, width="stretch")
+    else:
+        st.caption("Sem dado suficiente ainda para essa contagem.")
+
+    st.divider()
+    st.subheader("Postagens e comentários do período completo")
+    st.caption(
+        f"Base bruta para responder as perguntas do trabalho e montar os "
+        f"grafos fora daqui — {PERIODO_NOME}. O corpo do comentário sobrevive "
+        "só 7 dias no banco; para a parte mais antiga é recuperado do "
+        "arquivo da Arctic Shift. O texto do post (selftext) segue a mesma "
+        "lógica para posts coletados antes desta funcionalidade existir."
+        + ("" if texto_completo else " ⚠️ Volume de comentários fora da "
+           "retenção viva passou do teto de recuperação — faltam os mais "
+           "recentes da lacuna.")
+        + ("" if posts_completo else " ⚠️ Volume de posts sem selftext "
+           "recuperado passou do teto de recuperação — faltam os mais "
+           "recentes da lacuna."))
+
+    cp, cc = st.columns(2)
+    with cp:
+        st.caption(f"Postagens ({len(rows_posts)})")
+        if not rows_posts:
+            st.caption("Nenhuma postagem neste período.")
+        else:
+            df_posts = pd.DataFrame(rows_posts)
+            df_posts["created_utc"] = pd.to_datetime(df_posts["created_utc"], unit="s")
+            st.dataframe(
+                df_posts[["author", "title", "selftext", "flair", "score",
+                          "num_comments", "created_utc", "permalink"]],
+                hide_index=True, width="stretch", height=350,
+                column_config={"author": "autor", "title": "título",
+                               "selftext": "texto do post", "score": "curtidas",
+                               "num_comments": "comentários",
+                               "created_utc": st.column_config.DatetimeColumn(
+                                   "criado em", format="DD/MM/YYYY HH:mm")})
+            st.download_button(
+                "Baixar postagens (CSV)", _csv_safe(df_posts).to_csv(index=False).encode("utf-8"),
+                file_name=f"{SUB}_postagens_{PERIODO_NOME[:5].replace('/', '-')}.csv",
+                mime="text/csv")
+    with cc:
+        st.caption(f"Comentários ({len(rows_texto)})")
+        if not rows_texto:
+            st.caption("Nenhum comentário neste período.")
+        else:
+            df_com = pd.DataFrame(rows_texto)
+            df_com["created_utc"] = pd.to_datetime(df_com["created_utc"], unit="s")
+            st.dataframe(
+                df_com[["author", "body", "score", "flair", "created_utc"]],
+                hide_index=True, width="stretch", height=350,
+                column_config={"author": "autor", "body": "texto", "score": "curtidas",
+                               "flair": "tópico do post",
+                               "created_utc": st.column_config.DatetimeColumn(
+                                   "criado em", format="DD/MM/YYYY HH:mm")})
+            st.download_button(
+                "Baixar comentários (CSV)", _csv_safe(df_com).to_csv(index=False).encode("utf-8"),
+                file_name=f"{SUB}_comentarios_{PERIODO_NOME[:5].replace('/', '-')}.csv",
+                mime="text/csv")
+
+    st.divider()
+    st.header("Análise textual")
+    st.caption(
+        "Classifica cada item (comentário ou postagem) individualmente: "
+        "autor, texto, palavras principais, tópico, tribo, sentimento. "
+        "Escolha o escopo e os filtros abaixo — os gráficos seguintes usam a "
+        "mesma seleção. Sentimento é por léxico PT-BR (contagem de palavra "
+        "positiva/negativa): sinal aproximado, não entende negação, ironia "
+        "ou sarcasmo.")
+
+    itens = sna.combine_text_items(
+        [r for r in rows_texto if r.get("body")],
+        [r for r in rows_posts if r.get("title") or r.get("selftext")])
+
+    if not itens:
+        st.caption("Sem texto recuperável para classificar neste período.")
+    else:
+        escopo = st.radio(
+            "Escopo", ["Todos os itens do período", "Principais itens (por engajamento)"],
+            horizontal=True)
+        if escopo.startswith("Principais"):
+            maximo = len(itens)
+            n_principais = st.slider(
+                "Quantidade de itens", min(10, maximo), maximo, min(50, maximo))
+            itens_escopo = sorted(itens, key=lambda r: -(r.get("score") or 0))[:n_principais]
+        else:
+            itens_escopo = itens
+
+        classificado = sna.classify_comments(itens_escopo, comm_of, topics)
+        df_class = pd.DataFrame(classificado)
+
+        f1, f2, f3, f4 = st.columns(4)
+        topicos_sel = f1.multiselect("Tópico", sorted(df_class["topico"].unique()))
+        tribos_sel = f2.multiselect("Tribo", sorted(df_class["tribo"].unique()))
+        sent_sel = f3.multiselect("Sentimento", sorted(df_class["sentimento"].unique()))
+        tipo_sel = f4.multiselect("Tipo", sorted(df_class["tipo"].unique()))
+
+        df_filtrado = df_class
+        if topicos_sel:
+            df_filtrado = df_filtrado[df_filtrado["topico"].isin(topicos_sel)]
+        if tribos_sel:
+            df_filtrado = df_filtrado[df_filtrado["tribo"].isin(tribos_sel)]
+        if sent_sel:
+            df_filtrado = df_filtrado[df_filtrado["sentimento"].isin(sent_sel)]
+        if tipo_sel:
+            df_filtrado = df_filtrado[df_filtrado["tipo"].isin(tipo_sel)]
+
+        st.subheader("Classificação de conversas")
+        st.dataframe(
+            df_filtrado[["autor", "tipo", "texto", "palavras_principais",
+                         "topico", "tribo", "sentimento"]].sort_values("autor"),
+            hide_index=True, width="stretch", height=350,
+            column_config={
+                "autor": "autor", "tipo": "tipo",
+                "texto": st.column_config.TextColumn("texto", width="large"),
+                "palavras_principais": "palavras principais",
+                "topico": "tópico", "tribo": "tribo", "sentimento": "sentimento"})
+        st.download_button(
+            "Baixar classificação (CSV)", _csv_safe(df_filtrado).to_csv(index=False).encode("utf-8"),
+            file_name=f"{SUB}_classificacao_conversas.csv", mime="text/csv")
+
+        ids_filtrados = set(df_filtrado["id"])
+        classificado_filtrado = [c for c in classificado if c["id"] in ids_filtrados]
+        itens_filtrados_raw = [r for r in itens_escopo if r["id"] in ids_filtrados]
+
+        st.subheader("Sentimento por tópico")
+        sent_topico = pd.DataFrame(sna.sentiment_by_topic(classificado_filtrado))
+        if not sent_topico.empty:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(name="Positivo", y=sent_topico["topico"], x=sent_topico["positivo"],
+                                 orientation="h", marker_color="#2a9d8f"))
+            fig.add_trace(go.Bar(name="Neutro", y=sent_topico["topico"], x=sent_topico["neutro"],
+                                 orientation="h", marker_color="#8d99ae"))
+            fig.add_trace(go.Bar(name="Negativo", y=sent_topico["topico"], x=sent_topico["negativo"],
+                                 orientation="h", marker_color="#e76f51"))
+            fig.update_layout(barmode="stack", height=max(220, 30 * len(sent_topico)),
+                              margin=dict(t=30, b=10, l=0, r=0),
+                              legend=dict(orientation="h", y=1.15),
+                              yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, width="stretch")
+        else:
+            st.caption("Nada para mostrar com os filtros atuais.")
+
+        st.subheader("Tópicos por tribo")
+        cross = sna.topic_tribe_crosstab(classificado_filtrado)
+        if cross:
+            st.dataframe(pd.DataFrame(cross).fillna(0).astype(int).T, width="stretch")
+        else:
+            st.caption("Nada para mostrar com os filtros atuais.")
+
+        st.subheader("Quem introduz vocabulário")
+        adoption = pd.DataFrame(sna.term_adoption(itens_filtrados_raw))
+        if not adoption.empty:
+            adoption["primeiro_uso"] = pd.to_datetime(adoption["primeiro_uso"], unit="s")
+            st.dataframe(
+                adoption, hide_index=True, width="stretch",
+                column_config={
+                    "termo": "termo", "autor_pioneiro": "autor pioneiro",
+                    "primeiro_uso": st.column_config.DatetimeColumn("primeiro uso", format="DD/MM HH:mm"),
+                    "autores_depois": "autores que adotaram depois",
+                    "usos_totais": "usos totais"})
+        else:
+            st.caption("Nenhum termo com adoção subsequente clara nesta seleção.")
+
+        st.subheader("Termos possivelmente específicos de um tópico")
+        ctx_terms = pd.DataFrame(sna.context_specific_terms(itens_filtrados_raw))
+        if not ctx_terms.empty:
+            ctx_terms["concentracao"] = (ctx_terms["concentracao"] * 100).round(0).astype(int).astype(str) + "%"
+            st.dataframe(
+                ctx_terms, hide_index=True, width="stretch",
+                column_config={"termo": "termo", "topico_principal": "tópico principal",
+                               "concentracao": "concentração", "ocorrencias": "ocorrências"})
+        else:
+            st.caption("Nenhum termo atingiu o mínimo de ocorrências nesta seleção.")
+
+    st.stop()
 
 if FIXO:
     st.caption(f"Período fixo: {PERIODO_NOME} · projeção {PROJ}")

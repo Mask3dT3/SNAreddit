@@ -135,7 +135,7 @@ def recent_comments_with_body(sub, lookback_hours, now=None, start=None, end=Non
     lo = start if start is not None else now - lookback_hours * 3600
     hi = end if end is not None else now + 86400
     return query(
-        """select c.id, c.author, c.body, c.created_utc, s.flair as flair
+        """select c.id, c.author, c.body, c.score, c.created_utc, s.flair as flair
            from comments c left join submissions s on s.id = c.submission_id
            where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
              and c.body is not null and c.author is not null""",
@@ -154,12 +154,74 @@ def comments_missing_body(sub, start, end, limit=8000):
     truncou (guarda as mais antigas da lacuna, `order by created_utc`).
     """
     return query(
-        """select c.id, c.author, c.created_utc, s.flair as flair
+        """select c.id, c.author, c.score, c.created_utc, s.flair as flair
            from comments c left join submissions s on s.id = c.submission_id
            where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
              and c.body is null and c.author is not null
            order by c.created_utc limit %s""",
         (sub.lower(), start, end, limit))
+
+
+def raw_submissions(sub, start, end):
+    """Todas as postagens do periodo, sem agregar — usada pela exportacao de
+    dado bruto do modo de periodo fixo do dashboard. submissions nunca passa
+    por prune_old_data, entao a linha (inclusive title) sempre existe; so
+    selftext pode faltar em posts coletados antes da coluna existir (ver
+    submissions_missing_selftext)."""
+    return query(
+        """select id, author, title, selftext, flair, score, num_comments,
+                  created_utc, permalink
+           from submissions
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+           order by created_utc""",
+        (sub.lower(), start, end))
+
+
+def submissions_missing_selftext(sub, start, end, limit=8000):
+    """Posts cuja linha existe mas selftext ainda nao foi preenchido (coletados
+    antes desta coluna existir). Usada pelo dashboard para saber quais ids
+    pedir de volta ao Arctic Shift (collector.fetch_post_selftexts). Mesmo
+    teto de comments_missing_body, pelo mesmo motivo."""
+    return query(
+        """select id, created_utc from submissions
+           where subreddit=%s and created_utc>=%s and created_utc<=%s
+             and selftext is null
+           order by created_utc limit %s""",
+        (sub.lower(), start, end, limit))
+
+
+def replies_received(sub, window_hours, now=None, end=None):
+    """Quantas respostas cada autor recebeu no periodo: parent_id t1_ conta
+    pro autor do comentario-pai, parent_id t3_ conta pro autor do post.
+    Contagem literal via SQL, independente da projecao de grafo escolhida
+    (reply/copart) — ao contrario de w_in_degree/out_degree em actor_snapshots,
+    que so significam 'resposta' na projecao reply. O join de pai busca em
+    toda a tabela (sem limitar por created_utc, ao contrario do lookback de
+    14d/30d de sna.build_reply_graph): e busca por id (chave primaria), barato
+    mesmo sem filtro de data, e nao perde resposta a algo criado ha muito
+    antes do periodo. Ver end= em submission_titles."""
+    now = now or time.time()
+    end = end if end is not None else now + 86400
+    cutoff = now - window_hours * 3600
+    return query(
+        """select dst as author, count(*) as respostas_recebidas
+           from (
+             select case
+                      when c.parent_id like 't1_%%' then pc.author
+                      when c.parent_id like 't3_%%' then ps.author
+                    end as dst
+             from comments c
+             left join comments pc
+               on c.parent_id like 't1_%%' and pc.id = substring(c.parent_id from 4)
+             left join submissions ps
+               on c.parent_id like 't3_%%' and ps.id = substring(c.parent_id from 4)
+             where c.subreddit=%s and c.created_utc>=%s and c.created_utc<=%s
+               and c.author is not null and c.author not in %s
+           ) t
+           where dst is not null and dst not in %s
+           group by dst
+           order by respostas_recebidas desc""",
+        (sub.lower(), cutoff, end, _BOTS, _BOTS))
 
 
 def sample_interactions(sub, start, end, limit=200):

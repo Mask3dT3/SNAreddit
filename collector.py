@@ -65,7 +65,8 @@ def _norm_post(p, sub):
         return None
     return {
         "id": p["id"], "subreddit": sub.lower(), "author": p.get("author"),
-        "title": p.get("title"), "flair": p.get("link_flair_text"),
+        "title": p.get("title"), "selftext": p.get("selftext") or None,
+        "flair": p.get("link_flair_text"),
         "created_utc": float(p["created_utc"]), "score": p.get("score"),
         "num_comments": p.get("num_comments"), "permalink": p.get("permalink"),
         "fetched_utc": time.time(),
@@ -133,6 +134,49 @@ def fetch_comment_bodies(sub, start, end, ids_wanted, sleep=0.35):
             cid, ts = c.get("id"), c.get("created_utc")
             if cid in wanted and c.get("body"):
                 found[cid] = c["body"]
+            if ts is not None:
+                newest = max(newest, float(ts))
+        if newest <= cursor:
+            break
+        cursor = newest + 0.001
+        if len(batch) < PAGE:
+            break
+        time.sleep(sleep)
+    return found, True
+
+
+def fetch_post_selftexts(sub, start, end, ids_wanted, sleep=0.35):
+    """
+    Analogo a fetch_comment_bodies, mas para o texto do post (selftext).
+    submissions nunca passa por prune_old_data — a linha nunca e apagada —
+    mas selftext so existe a partir desta migracao: posts coletados antes
+    dela ficam com a coluna nula e precisam ser recuperados aqui, uma vez,
+    direto do arquivo da Arctic Shift. So-leitura, nao grava nada.
+
+    Devolve (selftexts_por_id, completo), mesma semantica de
+    fetch_comment_bodies. Post do tipo link (sem selftext) volta como
+    string vazia, nao ausente do dict, pra ficar distinguivel de "nao
+    verificado ainda".
+    """
+    wanted = set(ids_wanted)
+    found = {}
+    cursor, page = start, 0
+    while cursor < end and wanted - found.keys():
+        if page >= MAX_BACKFILL_PAGES:
+            return found, False
+        try:
+            batch = _fetch("posts", sub, cursor, end)
+        except Exception as e:
+            print(f"    fetch_post_selftexts: desistindo ({type(e).__name__})", file=sys.stderr)
+            return found, False
+        if not batch:
+            break
+        page += 1
+        newest = cursor
+        for p in batch:
+            pid, ts = p.get("id"), p.get("created_utc")
+            if pid in wanted:
+                found[pid] = p.get("selftext") or ""
             if ts is not None:
                 newest = max(newest, float(ts))
         if newest <= cursor:

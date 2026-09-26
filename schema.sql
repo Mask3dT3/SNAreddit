@@ -18,6 +18,7 @@ create table if not exists submissions (
     subreddit     text not null,
     author        text,
     title         text,
+    selftext      text,
     flair         text,
     created_utc   double precision not null,
     score         integer,
@@ -25,6 +26,13 @@ create table if not exists submissions (
     permalink     text,
     fetched_utc   double precision
 );
+
+-- Banco ja em producao (create table if not exists nao adiciona coluna a uma
+-- tabela existente): roda de novo, idempotente, para trazer selftext.
+-- Nunca e apagada por retencao (submissions nao passa por prune_old_data),
+-- entao posts coletados antes desta migracao ficam com selftext nulo ate
+-- o dashboard recupera-lo do arquivo da Arctic Shift (collector.fetch_post_selftexts).
+alter table submissions add column if not exists selftext text;
 
 -- projection: 'reply' ou 'copart' (sna.PROJECTIONS) — cada snapshot roda para
 -- as duas, entao ambas fazem parte da chave primaria.

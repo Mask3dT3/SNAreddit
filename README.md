@@ -45,21 +45,36 @@ Ordem importa — pular ou inverter um passo perde dado permanentemente.
    recupera nada — o texto já foi apagado.
 7. Depois disso, `collect` (10 min) e `analyze` (30 min) mantêm tudo atualizado sozinhos.
 
+## Migração (banco já em produção)
+
+Quem já tinha o banco criado antes da coluna `selftext` existir em `submissions`
+precisa colar `schema.sql` de novo no SQL Editor do Supabase (é idempotente —
+`create table if not exists` não mexe na tabela existente, mas o `alter table
+... add column if not exists selftext` logo depois dela roda e adiciona a
+coluna). Não precisa rodar nenhum backfill depois: posts antigos ficam com
+`selftext` nulo e o dashboard recupera o texto sob demanda direto da Arctic
+Shift quando alguém abrir o período fixo (mesmo mecanismo do corpo de
+comentário, ver "Limitações conhecidas" abaixo).
+
 ## Limitações conhecidas
 
 - **Retenção**: corpo do comentário sobrevive só 7 dias; a linha (sem corpo) sobrevive
-  120 dias; snapshots de grafo 365 dias; snapshots de ator 7 dias. Seções que dependem
+  120 dias; snapshots de grafo 365 dias; snapshots de ator 7 dias. Título e `selftext`
+  de post nunca são apagados (`submissions` não passa por `prune_old_data`) — só ficam
+  nulos em posts coletados antes da coluna `selftext` existir. Seções que dependem
   de texto (nuvem "por tribo", classificação de conversas em "Análise textual") cobrem
   a janela/período inteiro pedido, inclusive no modo de **período fixo**: o corpo que já
   saiu do banco pela retenção de 7 dias é recuperado na hora no arquivo histórico da
-  Arctic Shift (`collector.fetch_comment_bodies`, cache de 30 min no dashboard). Só não
+  Arctic Shift (`collector.fetch_comment_bodies`, cache de 30 min no dashboard), e o
+  mesmo vale para `selftext` ausente (`collector.fetch_post_selftexts`). Só não
   há o que recuperar além de 120 dias — aí a própria linha do comentário já foi apagada,
-  e essas seções mostram "sem dado", não erro. Esse recálculo sob demanda depende da
+  e essas seções mostram "sem dado", não erro (posts não têm esse teto, a linha nunca
+  é apagada). Esse recálculo sob demanda depende da
   Arctic Shift estar no ar; se ela falhar, a seção degrada pra "sem dado" em vez de
   quebrar o dashboard. Também tem teto de volume (`MISSING_BODY_LIMIT` = 8000
-  comentários, `MAX_BACKFILL_PAGES` = 80 páginas no collector): cobre a lacuna de 90
+  comentários/posts, `MAX_BACKFILL_PAGES` = 80 páginas no collector): cobre a lacuna de 90
   dias de um sub do porte de r/idiomas (~70 comentários/dia); se algum dia o volume
-  passar disso, a busca prioriza os comentários mais antigos da lacuna e o dashboard
+  passar disso, a busca prioriza os itens mais antigos da lacuna e o dashboard
   avisa explicitamente ("volume alto demais para recuperar tudo") em vez de mostrar um
   recorte incompleto sem dizer nada.
 - **Cadência real dos cron**: o agendamento do GitHub Actions é otimista — sob carga da
